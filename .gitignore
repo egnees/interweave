@@ -1,0 +1,4 @@
+/target
+
+# Machine-local Claude Code settings (agent definitions are tracked).
+/.claude/settings.local.json
