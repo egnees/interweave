@@ -19,40 +19,42 @@
 //!
 //! # Example
 //!
-//! Two accounts hold a fixed total of 100. A `transfer` moves 10 from `a` to `b`
-//! in separate, unlocked steps; an `audit` reads both and checks the total. With
-//! no lock held across the two accounts, Optimal DPOR finds the interleaving
-//! where the auditor catches the money mid-transfer:
+//! A `producer` hands a value to a `consumer` through a one-shot `ready` flag,
+//! but raises the flag *before* it writes the value. Optimal DPOR finds the
+//! interleaving where the consumer sees `ready` set yet reads the stale,
+//! not-yet-published value — the unsafe-publication race behind broken
+//! double-checked locking:
 //!
 //! ```
 //! use interweave::{Strategy, World, explore};
 //!
-//! fn bank(world: &mut World) {
-//!     let a = world.atomic("a", 100);
-//!     let b = world.atomic("b", 0);
+//! fn publish(world: &mut World) {
+//!     let data = world.atomic("data", 0);
+//!     let ready = world.atomic("ready", 0);
 //!
-//!     let (from, to) = (a.clone(), b.clone());
-//!     world.spawn("transfer", async move {
-//!         let av = from.load().await;
-//!         from.store(av - 10).await;
-//!         let bv = to.load().await;
-//!         to.store(bv + 10).await;
+//!     let (data_w, ready_w) = (data.clone(), ready.clone());
+//!     world.spawn("producer", async move {
+//!         ready_w.store(1).await; // announce the value...
+//!         data_w.store(42).await; // ...before it has been written
 //!         Ok(())
 //!     });
 //!
-//!     world.spawn("audit", async move {
-//!         let av = a.load().await;
-//!         let bv = b.load().await;
-//!         if av + bv != 100 {
-//!             return Err(format!("invariant violated: a={av} + b={bv}").into());
+//!     world.spawn("consumer", async move {
+//!         // No wait loop: the checker explores the schedule where the flag is
+//!         // already set, so a single guarded read stays a finite safety check.
+//!         if ready.load().await == 1 {
+//!             let v = data.load().await;
+//!             if v != 42 {
+//!                 return Err(format!("read the value before it was published: {v}").into());
+//!             }
 //!         }
 //!         Ok(())
 //!     });
 //! }
 //!
-//! // `()` is the no-op observer; Optimal DPOR finds a schedule that breaks the
-//! // `a + b == 100` invariant.
-//! explore(&bank, &mut (), Strategy::Optimal).expect_err("the transfer has a race");
+//! // `()` is the no-op observer; Optimal DPOR finds the schedule where the
+//! // consumer sees `ready == 1` but still reads the stale `data`.
+//! explore(&publish, &mut (), Strategy::Optimal).expect_err("publishes the flag before the value");
 //! ```
 //!
 //! # Architecture

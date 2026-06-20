@@ -24,47 +24,57 @@ top, which is where Optimal DPOR lives.
 
 Write a concurrent program against `World` / `Atomic`, then `explore` every
 interleaving. The result is `Ok` if all of them pass, or the first failing one.
-Here two accounts hold a fixed total of 100; a `transfer` moves money between
-them in separate, unlocked steps, and an `audit` checks the total — so Optimal
-DPOR finds the schedule where the auditor catches the money mid-transfer:
+Here a `producer` hands a value to a `consumer` through a `ready` flag, but
+raises the flag *before* it has written the value — so Optimal DPOR finds the
+schedule where the consumer sees the flag set yet reads the stale value, the
+unsafe-publication race behind broken double-checked locking:
 
 ```rust
 use interweave::{Strategy, World, explore};
 
-fn bank(world: &mut World) {
-    let a = world.atomic("a", 100);
-    let b = world.atomic("b", 0);
+fn publish(world: &mut World) {
+    let data = world.atomic("data", 0);
+    let ready = world.atomic("ready", 0);
 
-    let (from, to) = (a.clone(), b.clone());
-    world.spawn("transfer", async move {
-        let av = from.load().await;
-        from.store(av - 10).await;
-        let bv = to.load().await;
-        to.store(bv + 10).await;
+    let (data_w, ready_w) = (data.clone(), ready.clone());
+    world.spawn("producer", async move {
+        ready_w.store(1).await; // announce the value...
+        data_w.store(42).await; // ...before it has been written
         Ok(())
     });
 
-    world.spawn("audit", async move {
-        let av = a.load().await;
-        let bv = b.load().await;
-        if av + bv != 100 {
-            return Err(format!("invariant violated: a={av} + b={bv}").into());
+    world.spawn("consumer", async move {
+        // No wait loop: the checker explores the schedule where the flag is
+        // already set, so a single guarded read stays a finite safety check.
+        if ready.load().await == 1 {
+            let v = data.load().await;
+            if v != 42 {
+                return Err(format!("read the value before it was published: {v}").into());
+            }
         }
         Ok(())
     });
 }
 
-// Optimal DPOR finds a schedule that breaks the `a + b == 100` invariant.
-explore(&bank, &mut (), Strategy::Optimal).expect_err("the transfer has a race");
+// Optimal DPOR finds the schedule where the consumer sees `ready == 1` but
+// still reads the stale `data`.
+explore(&publish, &mut (), Strategy::Optimal).expect_err("publishes the flag before the value");
 ```
+
+Writing the value *before* raising the flag fixes it, and the checker then
+clears every interleaving — that is the other half of its job, a proof rather
+than the absence of a failing test run.
 
 Runnable examples live in [`examples/`](examples):
 
-- `bank` — the program above, with the failing schedule printed out.
+- `publish` — the program above, with the failing schedule printed out.
+- `bank` — two accounts and a non-atomic transfer; the auditor catches the money
+  mid-transfer.
 - `readers` / `lastzero` / `indexer` — reproduce the POPL'14 Optimal-DPOR
   benchmark counts (one maximal trace per Mazurkiewicz class).
 
 ```sh
+cargo run --example publish
 cargo run --example bank
 cargo run --release --example lastzero 6
 ```
