@@ -453,21 +453,78 @@ fn node_at_mut<'w>(root: &'w mut Wut, path: &[usize]) -> &'w mut Wut {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt::Debug;
 
     use super::{State, event_clocks, happens_before};
     use crate::Atomic;
     use crate::model::World;
     use crate::search::{Observer, Strategy, explore};
 
-    // Counts the leaves (terminal or failed states) a search reaches — i.e. the
-    // number of maximal interleavings explored.
+    // --- spawn helpers ----------------------------------------------------------
+    // Every fixture is a fixed set of processes, each a short sequence of atomic ops
+    // ending in `Ok(())`. These wrap the spawn-a-future-of-one-op boilerplate so a
+    // fixture reads as the program it models, not as async plumbing.
+
+    fn spawn_store<'a, T>(world: &mut World<'a>, name: impl Into<String>, cell: Atomic<T>, value: T)
+    where
+        T: Copy + PartialEq + Debug + 'static,
+    {
+        world.spawn(name, async move {
+            cell.store(value).await;
+            Ok(())
+        });
+    }
+
+    fn spawn_load<'a, T>(world: &mut World<'a>, name: impl Into<String>, cell: Atomic<T>)
+    where
+        T: Copy + PartialEq + Debug + 'static,
+    {
+        world.spawn(name, async move {
+            cell.load().await;
+            Ok(())
+        });
+    }
+
+    // A writer that publishes `load(src) + 1` into `dst` — the lastzero(N) writer
+    // shape (each writer chains its source cell to its target cell).
+    fn spawn_increment<'a>(
+        world: &mut World<'a>,
+        name: impl Into<String>,
+        src: Atomic<i32>,
+        dst: Atomic<i32>,
+    ) {
+        world.spawn(name, async move {
+            let v = src.load().await;
+            dst.store(v + 1).await;
+            Ok(())
+        });
+    }
+
+    // `count` distinct atomics named `<prefix>0..<prefix>(count-1)`, all
+    // zero-initialized. Distinct objects (distinct oids) are what make two cells
+    // independent.
+    fn cells<'a>(world: &mut World<'a>, prefix: &str, count: usize) -> Vec<Atomic<i32>> {
+        (0..count)
+            .map(|i| world.atomic(format!("{prefix}{i}"), 0i32))
+            .collect()
+    }
+
+    // --- observers / metrics ----------------------------------------------------
+
+    // A leaf is a terminal or failed state — one maximal interleaving.
+    fn is_leaf(state: &State) -> bool {
+        state.failure_reason().is_some() || state.enabled().is_empty()
+    }
+
+    // Counts the leaves a search reaches — i.e. the number of maximal interleavings
+    // explored.
     #[derive(Default)]
     struct Leaves(usize);
 
     impl Observer for Leaves {
         fn observe(&mut self, state: &State) {
-            if state.failure_reason().is_some() || state.enabled().is_empty() {
+            if is_leaf(state) {
                 self.0 += 1;
             }
         }
@@ -484,40 +541,45 @@ mod tests {
     // event labels (pid, per-process index, object). Equivalent interleavings share
     // one canonical form, so the count of distinct forms is the class count — the
     // exact number Optimal DPOR must explore.
-    // A canonical happens-before form: ordered pairs of stable event labels
-    // (pid, the process's own op index, object).
+
+    // A canonical happens-before form: ordered pairs of stable event labels, where a
+    // label is (pid, the process's own op index, object).
     type Label = (usize, usize, usize);
     type Canon = BTreeSet<(Label, Label)>;
+
+    // The canonical happens-before form of one maximal trace.
+    fn canon(state: &State) -> Canon {
+        let trace = state.trace();
+        let n = trace.len();
+        let clocks = event_clocks(state, trace);
+        // Stable label per event: (pid, index among the process's own ops, oid).
+        let mut seen = BTreeMap::<usize, usize>::new();
+        let mut label = vec![(0usize, 0usize, 0usize); n + 1];
+        for k in 1..=n {
+            let t = trace[k - 1];
+            let idx = seen.entry(t.pid).or_default();
+            label[k] = (t.pid, *idx, t.oid);
+            *idx += 1;
+        }
+        let mut hb = Canon::new();
+        for j in 1..=n {
+            for i in 1..j {
+                if happens_before(&clocks, trace, i, j) {
+                    hb.insert((label[i], label[j]));
+                }
+            }
+        }
+        hb
+    }
 
     #[derive(Default)]
     struct Classes(BTreeSet<Canon>);
 
     impl Observer for Classes {
         fn observe(&mut self, state: &State) {
-            if !(state.failure_reason().is_some() || state.enabled().is_empty()) {
-                return;
+            if is_leaf(state) {
+                self.0.insert(canon(state));
             }
-            let trace = state.trace();
-            let n = trace.len();
-            let clocks = event_clocks(state, trace);
-            // Stable label per event: (pid, index among the process's own ops, oid).
-            let mut seen = std::collections::BTreeMap::<usize, usize>::new();
-            let mut label = vec![(0usize, 0usize, 0usize); n + 1];
-            for k in 1..=n {
-                let t = trace[k - 1];
-                let idx = seen.entry(t.pid).or_default();
-                label[k] = (t.pid, *idx, t.oid);
-                *idx += 1;
-            }
-            let mut hb = BTreeSet::new();
-            for j in 1..=n {
-                for i in 1..j {
-                    if happens_before(&clocks, trace, i, j) {
-                        hb.insert((label[i], label[j]));
-                    }
-                }
-            }
-            self.0.insert(hb);
         }
     }
 
@@ -540,60 +602,48 @@ mod tests {
         assert!(opt <= dfs, "Optimal must never explore more than DFS");
     }
 
+    // The common shape: DFS sees `dfs` leaves, Optimal sees `optimal`, and Optimal
+    // is one-per-class against ground truth.
+    fn assert_leaves<'a>(setup: &'a dyn Fn(&mut World<'a>), dfs: usize, optimal: usize) {
+        assert_eq!(leaves(setup, Strategy::Dfs), dfs, "DFS leaf count");
+        assert_eq!(
+            leaves(setup, Strategy::Optimal),
+            optimal,
+            "Optimal leaf count"
+        );
+        assert_optimal(setup);
+    }
+
     // --- fixtures ---------------------------------------------------------------
 
     // Two loads of one atomic: read/read independent.
     fn two_loaders(world: &mut World) {
         let x = world.atomic("x", 0u32);
-        let (a, b) = (x.clone(), x.clone());
-        world.spawn("reader-1", async move {
-            a.load().await;
-            Ok(())
-        });
-        world.spawn("reader-2", async move {
-            b.load().await;
-            Ok(())
-        });
+        spawn_load(world, "reader-1", x.clone());
+        spawn_load(world, "reader-2", x);
     }
 
     // Stores to two different atomics: independent (different objects).
     fn two_objects(world: &mut World) {
         let x = world.atomic("x", 0u32);
         let y = world.atomic("y", 0u32);
-        world.spawn("writer-x", async move {
-            x.store(1).await;
-            Ok(())
-        });
-        world.spawn("writer-y", async move {
-            y.store(1).await;
-            Ok(())
-        });
+        spawn_store(world, "writer-x", x, 1);
+        spawn_store(world, "writer-y", y, 1);
     }
 
     // Two stores to one atomic: dependent (the cell value differs by order).
     fn two_writers(world: &mut World) {
         let x = world.atomic("x", 0u32);
-        let (a, b) = (x.clone(), x.clone());
-        world.spawn("writer-1", async move {
-            a.store(1).await;
-            Ok(())
-        });
-        world.spawn("writer-2", async move {
-            b.store(2).await;
-            Ok(())
-        });
+        spawn_store(world, "writer-1", x.clone(), 1);
+        spawn_store(world, "writer-2", x, 2);
     }
 
     // The reader errors unless it observes the writer's store.
     fn racy(world: &mut World) {
         let x = world.atomic("x", 0u32);
-        let (w, r) = (x.clone(), x.clone());
-        world.spawn("writer", async move {
-            w.store(1).await;
-            Ok(())
-        });
+        spawn_store(world, "writer", x.clone(), 1);
         world.spawn("reader", async move {
-            if r.load().await == 1 {
+            if x.load().await == 1 {
                 Ok(())
             } else {
                 Err("unexpected value".into())
@@ -613,11 +663,7 @@ mod tests {
     fn three_writers(world: &mut World) {
         let x = world.atomic("x", 0u32);
         for i in 1..=3u32 {
-            let h = x.clone();
-            world.spawn(format!("w{i}"), async move {
-                h.store(i).await;
-                Ok(())
-            });
+            spawn_store(world, format!("w{i}"), x.clone(), i);
         }
     }
 
@@ -625,19 +671,9 @@ mod tests {
     // but each races the writer. DFS explores 3! = 6 orders; the classes are fewer.
     fn one_writer_two_readers(world: &mut World) {
         let x = world.atomic("x", 0u32);
-        let (w, r1, r2) = (x.clone(), x.clone(), x.clone());
-        world.spawn("writer", async move {
-            w.store(1).await;
-            Ok(())
-        });
-        world.spawn("reader-1", async move {
-            r1.load().await;
-            Ok(())
-        });
-        world.spawn("reader-2", async move {
-            r2.load().await;
-            Ok(())
-        });
+        spawn_store(world, "writer", x.clone(), 1);
+        spawn_load(world, "reader-1", x.clone());
+        spawn_load(world, "reader-2", x);
     }
 
     // lastzero-style: a data-dependent reader whose control flow follows racy cells.
@@ -648,19 +684,11 @@ mod tests {
     fn lastzero_toy(world: &mut World) {
         let a = world.atomic("a", 0u32);
         let b = world.atomic("b", 0u32);
-        let (wa, wb) = (a.clone(), b.clone());
-        world.spawn("write-a", async move {
-            wa.store(1).await;
-            Ok(())
-        });
-        world.spawn("write-b", async move {
-            wb.store(1).await;
-            Ok(())
-        });
-        let (ra, rb) = (a.clone(), b.clone());
+        spawn_store(world, "write-a", a.clone(), 1);
+        spawn_store(world, "write-b", b.clone(), 1);
         world.spawn("reader", async move {
-            if ra.load().await == 0 {
-                rb.load().await;
+            if a.load().await == 0 {
+                b.load().await;
             }
             Ok(())
         });
@@ -676,22 +704,13 @@ mod tests {
     fn branch_changes_ops(world: &mut World) {
         let x = world.atomic("x", 0u32);
         let y = world.atomic("y", 0u32);
-        let wx = x.clone();
-        world.spawn("write-x", async move {
-            wx.store(1).await;
-            Ok(())
-        });
-        let wy = y.clone();
-        world.spawn("write-y", async move {
-            wy.store(1).await;
-            Ok(())
-        });
-        let (rx, ry) = (x.clone(), y.clone());
+        spawn_store(world, "write-x", x.clone(), 1);
+        spawn_store(world, "write-y", y.clone(), 1);
         world.spawn("reader", async move {
-            if rx.load().await == 0 {
-                ry.load().await;
+            if x.load().await == 0 {
+                y.load().await;
             } else {
-                ry.store(2).await;
+                y.store(2).await;
             }
             Ok(())
         });
@@ -709,17 +728,9 @@ mod tests {
     // plumbing, not a race, so it is not modeled.
     fn readers(world: &mut World, n: usize) {
         let x = world.atomic("x", 0u32);
-        let w = x.clone();
-        world.spawn("writer", async move {
-            w.store(42).await;
-            Ok(())
-        });
+        spawn_store(world, "writer", x.clone(), 42);
         for i in 1..=n {
-            let r = x.clone();
-            world.spawn(format!("reader-{i}"), async move {
-                r.load().await;
-                Ok(())
-            });
+            spawn_load(world, format!("reader-{i}"), x.clone());
         }
     }
 
@@ -728,9 +739,7 @@ mod tests {
     // writer j stores `load(a[j-1]) + 1` into `a[j]`. The reader's data-dependent
     // control flow replays automatically. ⇒ (N+3)·2^(N-2) classes.
     fn lastzero(world: &mut World, n: usize) {
-        let cells: Vec<Atomic<i32>> = (0..=n)
-            .map(|i| world.atomic(format!("a{i}"), 0i32))
-            .collect();
+        let cells = cells(world, "a", n + 1);
         let rc = cells.to_vec();
         world.spawn("reader", async move {
             let mut i = n;
@@ -746,13 +755,12 @@ mod tests {
             Ok(())
         });
         for j in 1..=n {
-            let r = cells[j - 1].clone();
-            let w = cells[j].clone();
-            world.spawn(format!("writer-{j}"), async move {
-                let v = r.load().await;
-                w.store(v + 1).await;
-                Ok(())
-            });
+            spawn_increment(
+                world,
+                format!("writer-{j}"),
+                cells[j - 1].clone(),
+                cells[j].clone(),
+            );
         }
     }
 
@@ -763,9 +771,7 @@ mod tests {
     // NUM_THREADS is large enough that two `w`s hash to the same slot — that is the
     // only source of dependent ops. Branch on the Ok/Err discriminant, not the value.
     fn indexer(world: &mut World, num_threads: usize) {
-        let table: Vec<Atomic<i32>> = (0..128)
-            .map(|i| world.atomic(format!("t{i}"), 0i32))
-            .collect();
+        let table = cells(world, "t", 128);
         for tid in 0..num_threads {
             let tab = table.to_vec();
             world.spawn(format!("thread-{tid}"), async move {
@@ -796,9 +802,7 @@ mod tests {
     // ground truth (assert_optimal runs exhaustive DFS, which is astronomical for
     // the real indexer).
     fn indexer_collision(world: &mut World, n: usize) {
-        let cells: Vec<Atomic<i32>> = (0..=n)
-            .map(|i| world.atomic(format!("c{i}"), 0i32))
-            .collect();
+        let cells = cells(world, "c", n + 1);
         for tid in 0..2 {
             let tab = cells.to_vec();
             world.spawn(format!("t{tid}"), async move {
@@ -819,32 +823,24 @@ mod tests {
 
     #[test]
     fn reduces_read_read() {
-        assert_eq!(leaves(&two_loaders, Strategy::Dfs), 2);
-        assert_eq!(leaves(&two_loaders, Strategy::Optimal), 1);
-        assert_optimal(&two_loaders);
+        assert_leaves(&two_loaders, 2, 1);
     }
 
     #[test]
     fn reduces_disjoint_objects() {
-        assert_eq!(leaves(&two_objects, Strategy::Dfs), 2);
-        assert_eq!(leaves(&two_objects, Strategy::Optimal), 1);
-        assert_optimal(&two_objects);
+        assert_leaves(&two_objects, 2, 1);
     }
 
     #[test]
     fn keeps_dependent_writes() {
         // Two stores to one atomic are inequivalent in either order: no reduction.
-        assert_eq!(leaves(&two_writers, Strategy::Dfs), 2);
-        assert_eq!(leaves(&two_writers, Strategy::Optimal), 2);
-        assert_optimal(&two_writers);
+        assert_leaves(&two_writers, 2, 2);
     }
 
     #[test]
     fn keeps_three_writers() {
         // 3! inequivalent orders: Optimal matches DFS exactly (6), none pruned.
-        assert_eq!(leaves(&three_writers, Strategy::Dfs), 6);
-        assert_eq!(leaves(&three_writers, Strategy::Optimal), 6);
-        assert_optimal(&three_writers);
+        assert_leaves(&three_writers, 6, 6);
     }
 
     #[test]
@@ -907,9 +903,9 @@ mod tests {
 
     #[test]
     fn readers_small() {
-        assert_optimal(&|w| readers(w, 2));
-        assert_optimal(&|w| readers(w, 3));
-        assert_optimal(&|w| readers(w, 4));
+        for n in 2..=4 {
+            assert_optimal(&|w| readers(w, n));
+        }
         assert_eq!(leaves(&|w| readers(w, 2), Strategy::Optimal), 4);
     }
 
