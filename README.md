@@ -23,31 +23,44 @@ top, which is where Optimal DPOR lives.
 ## Usage
 
 Write a concurrent program against `World` / `Atomic`, then `explore` every
-interleaving. The result is `Ok` if all of them pass, or the first failing one:
+interleaving. The result is `Ok` if all of them pass, or the first failing one.
+Here two accounts hold a fixed total of 100; a `transfer` moves money between
+them in separate, unlocked steps, and an `audit` checks the total — so Optimal
+DPOR finds the schedule where the auditor catches the money mid-transfer:
 
 ```rust
 use interweave::{Strategy, World, explore};
 
-fn program(world: &mut World) {
-    let x = world.atomic("x", 0u32);
-    let a = x.clone();
-    world.spawn("writer-1", async move {
-        a.store(1).await;
+fn bank(world: &mut World) {
+    let a = world.atomic("a", 100);
+    let b = world.atomic("b", 0);
+
+    let (from, to) = (a.clone(), b.clone());
+    world.spawn("transfer", async move {
+        let av = from.load().await;
+        from.store(av - 10).await;
+        let bv = to.load().await;
+        to.store(bv + 10).await;
         Ok(())
     });
-    world.spawn("writer-2", async move {
-        x.store(2).await;
+
+    world.spawn("audit", async move {
+        let av = a.load().await;
+        let bv = b.load().await;
+        if av + bv != 100 {
+            return Err(format!("invariant violated: a={av} + b={bv}").into());
+        }
         Ok(())
     });
 }
 
-explore(&program, &mut (), Strategy::Optimal).expect("no interleaving fails");
+// Optimal DPOR finds a schedule that breaks the `a + b == 100` invariant.
+explore(&bank, &mut (), Strategy::Optimal).expect_err("the transfer has a race");
 ```
 
 Runnable examples live in [`examples/`](examples):
 
-- `bank` — the checker finding a non-atomic money-transfer bug (a dirty/torn
-  read that breaks an `a + b == const` invariant).
+- `bank` — the program above, with the failing schedule printed out.
 - `readers` / `lastzero` / `indexer` — reproduce the POPL'14 Optimal-DPOR
   benchmark counts (one maximal trace per Mazurkiewicz class).
 
