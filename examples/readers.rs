@@ -9,56 +9,34 @@
 //! cargo run --release --example readers -- [N]   # default N = 8 => 256 traces
 //! ```
 
-use std::env;
+#[path = "common/mod.rs"]
+mod common;
 
-use interweave::{Observer, State, Strategy, World, explore};
+use interweave::World;
 
 fn readers(world: &mut World, n: usize) {
     let x = world.atomic("x", 0u32);
-    let w = x.clone();
+    let writer = x.clone();
     world.spawn("writer", async move {
-        w.store(42).await;
+        writer.store(42).await;
         Ok(())
     });
     for i in 1..=n {
-        let r = x.clone();
+        let reader = x.clone();
         world.spawn(format!("reader-{i}"), async move {
-            r.load().await;
+            reader.load().await;
             Ok(())
         });
     }
 }
 
-// Counts maximal traces (leaves) and total visited states.
-#[derive(Default)]
-struct Counter {
-    traces: usize,
-    states: usize,
-}
-
-impl Observer for Counter {
-    fn observe(&mut self, state: &State) {
-        self.states += 1;
-        if state.is_terminal() {
-            self.traces += 1;
-        }
-    }
-}
-
 fn main() {
-    let n = env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(8);
-
-    let setup = move |w: &mut World| readers(w, n);
-    let mut counter = Counter::default();
-    let result = explore(&setup, &mut counter, Strategy::Optimal);
-
+    let n = common::size(8);
+    let counts = common::explore_counts(move |w| readers(w, n));
     println!(
         "readers({n}): traces={} (expected {}), states={}",
-        counter.traces,
+        counts.traces,
         1usize << n,
-        counter.states,
+        counts.states,
     );
-    if let Err(failed) = result {
-        eprintln!("unexpected failure: {failed}");
-    }
 }
