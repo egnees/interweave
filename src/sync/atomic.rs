@@ -246,12 +246,13 @@ impl<T: Copy + PartialEq + Debug + 'static> Object for Handle<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Executor;
+    use crate::model::{Executor, ProcessResult};
     use std::cell::Cell;
+    use std::future::Future;
 
     // Drives the strategy by hand: keep committing the first enabled transition and resuming the
-    // executor until the process finishes. `apply` needs `&mut Handle`, but the state lives behind
-    // an `Rc`, so any clone works.
+    // executor until every process finishes. `apply` needs `&mut Handle`, but the cell lives behind
+    // an `Rc`, so any clone serves as the `&mut` object.
     fn drive(exec: &mut Executor, obj: &mut impl Object) {
         exec.execute().unwrap();
         while let Some(&t) = obj.enabled().first() {
@@ -260,40 +261,49 @@ mod tests {
         }
     }
 
+    // Runs `body` as the only process against `atomic`, committing each op in turn.
+    fn run_single(atomic: &Handle<u32>, body: impl Future<Output = ProcessResult> + 'static) {
+        let mut exec = Executor::default();
+        exec.schedule(body);
+        drive(&mut exec, &mut atomic.clone());
+    }
+
+    // A shared slot a process moves a clone of and writes its observed value into.
+    fn slot<T: Copy>(init: T) -> Rc<Cell<T>> {
+        Rc::new(Cell::new(init))
+    }
+
+    // The first enabled op of process `pid` on `atomic`.
+    fn enabled_of(atomic: &Handle<u32>, pid: usize) -> Transition {
+        *atomic.enabled().iter().find(|t| t.pid == pid).unwrap()
+    }
+
     #[test]
     fn load_observes_initial_value() {
         let a = Handle::new(0, 42u32);
-        let out = Rc::new(Cell::new(0));
+        let seen = slot(0);
 
-        let mut exec = Executor::default();
-        let h = a.clone();
-        let o = out.clone();
-        exec.schedule(async move {
-            o.set(h.load().await);
+        let (h, dst) = (a.clone(), seen.clone());
+        run_single(&a, async move {
+            dst.set(h.load().await);
             Ok(())
         });
 
-        drive(&mut exec, &mut a.clone());
-        assert_eq!(out.get(), 42);
+        assert_eq!(seen.get(), 42);
     }
 
     #[test]
     fn store_writes_and_returns_previous() {
         let a = Handle::new(0, 1u32);
-        let prev = Rc::new(Cell::new(0));
-        let after = Rc::new(Cell::new(0));
+        let (prev, after) = (slot(0), slot(0));
 
-        let mut exec = Executor::default();
-        let h = a.clone();
-        let p = prev.clone();
-        let af = after.clone();
-        exec.schedule(async move {
+        let (h, p, af) = (a.clone(), prev.clone(), after.clone());
+        run_single(&a, async move {
             p.set(h.store(9).await);
             af.set(h.load().await);
             Ok(())
         });
 
-        drive(&mut exec, &mut a.clone());
         assert_eq!(prev.get(), 1);
         assert_eq!(after.get(), 9);
     }
@@ -301,53 +311,44 @@ mod tests {
     #[test]
     fn compare_exchange_swaps_on_match() {
         let a = Handle::new(0, 1u32);
-        let res = Rc::new(Cell::new(Err(0)));
-        let after = Rc::new(Cell::new(0));
+        let (res, after) = (slot(Err(0)), slot(0));
 
-        let mut exec = Executor::default();
-        let h = a.clone();
-        let r = res.clone();
-        let af = after.clone();
-        exec.schedule(async move {
+        let (h, r, af) = (a.clone(), res.clone(), after.clone());
+        run_single(&a, async move {
             r.set(h.compare_exchange(1, 9).await);
             af.set(h.load().await);
             Ok(())
         });
 
-        drive(&mut exec, &mut a.clone());
         assert_eq!(res.get(), Ok(1));
         assert_eq!(after.get(), 9);
     }
 
-    // The defining RMW property: the compare happens at commit, not at registration. Another
-    // process stores between this CAS's registration and its commit, so the CAS sees the fresh
-    // value and reports the mismatch.
+    // The defining RMW property: the compare happens at commit, not at registration. Both ops are
+    // registered first; committing the store *before* the CAS makes the CAS see the fresh value
+    // (5 != 1) and report the mismatch.
     #[test]
     fn compare_exchange_observes_commit_time_value() {
         let a = Handle::new(0, 1u32);
-        let res = Rc::new(Cell::new(Ok(0)));
+        let res = slot(Ok(0));
 
         let mut exec = Executor::default();
-        let h = a.clone();
-        let r = res.clone();
+        let (cas_h, r) = (a.clone(), res.clone());
         exec.schedule(async move {
-            r.set(h.compare_exchange(1, 9).await);
+            r.set(cas_h.compare_exchange(1, 9).await);
             Ok(())
         });
-        let h2 = a.clone();
+        let store_h = a.clone();
         exec.schedule(async move {
-            h2.store(5).await;
+            store_h.store(5).await;
             Ok(())
         });
         exec.execute().unwrap();
 
-        // Both ops are registered and pending; commit the store, then the CAS.
         let mut obj = a.clone();
-        let store = *obj.enabled().iter().find(|t| t.pid == 1).unwrap();
-        obj.apply(store);
+        obj.apply(enabled_of(&obj, 1));
         exec.execute().unwrap();
-        let cas = *obj.enabled().iter().find(|t| t.pid == 0).unwrap();
-        obj.apply(cas);
+        obj.apply(enabled_of(&obj, 0));
         exec.execute().unwrap();
 
         assert_eq!(res.get(), Err(5));
