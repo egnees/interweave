@@ -101,12 +101,18 @@ impl<'a> World<'a> {
             source: raw.source,
         }
     }
+
+    // Drives the executor and reports a process error as a settled failure.
+    fn run(&mut self) -> Option<FailureReason> {
+        self.exec
+            .execute()
+            .err()
+            .map(|raw| FailureReason::Process(self.named_error(raw)))
+    }
 }
 
 /// The error reported when a process future returns `Err`, naming the offending
 /// process.
-// A process future returned an error. Public and name-bearing, so the failure
-// honestly reports which process erred rather than an internal id.
 #[derive(Debug, thiserror::Error)]
 #[error("process {process} failed: {source}")]
 pub struct ProcessError {
@@ -125,9 +131,6 @@ impl ProcessError {
 ///
 /// A `State` reports this about itself via [`State::failure_reason`], so the search
 /// layer sees failed states through the same interface as healthy ones.
-// Why a settled state can make no further useful progress. A `State` reports this
-// about itself, so the observer sees failed states through the same interface as
-// healthy ones.
 #[derive(Debug, thiserror::Error)]
 pub enum FailureReason {
     /// A process future returned an error.
@@ -203,10 +206,7 @@ impl<'a> State<'a> {
     fn new(setup: &'a dyn Fn(&mut World<'a>)) -> Self {
         let mut world = World::default();
         setup(&mut world);
-        let failure = match world.exec.execute() {
-            Ok(()) => None,
-            Err(raw) => Some(FailureReason::Process(world.named_error(raw))),
-        };
+        let failure = world.run();
         let mut state = Self {
             world,
             setup,
@@ -277,10 +277,8 @@ impl<'a> State<'a> {
             .collect()
     }
 
-    // Whether two transitions conflict. Different objects never do; same object
-    // delegates to the object itself. `world.objects` is the private field (not
-    // the `objects()` name table) — reachable here as State and World share a
-    // module.
+    // Transitions on different objects are independent; same-object pairs are the
+    // object's call.
     pub(crate) fn depends(&self, t1: Transition, t2: Transition) -> bool {
         if t1.oid != t2.oid {
             return false;
@@ -288,9 +286,8 @@ impl<'a> State<'a> {
         self.world.objects[t1.oid].depends(t1, t2)
     }
 
-    // Whether two transitions could be simultaneously enabled. Different objects
-    // always can; same object delegates (a blocking primitive may rule out a pair
-    // that is never simultaneously enabled).
+    // Transitions on different objects can always coexist; a blocking primitive may
+    // rule out a same-object pair that is never simultaneously enabled.
     pub(crate) fn co_enabled(&self, t1: Transition, t2: Transition) -> bool {
         if t1.oid != t2.oid {
             return true;
@@ -304,10 +301,7 @@ impl<'a> State<'a> {
         // the view of a failed state must replay the failure (see FailedState).
         self.trace.push(t);
         self.world.objects[t.oid].apply(t);
-        self.failure = match self.world.exec.execute() {
-            Ok(()) => None,
-            Err(raw) => Some(FailureReason::Process(self.world.named_error(raw))),
-        };
+        self.failure = self.world.run();
         self.settle();
     }
 

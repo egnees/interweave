@@ -73,7 +73,6 @@ impl<'a> Executor<'a> {
 
     /// Number of live processes: scheduled but not yet completed (completion drops
     /// the slot). Used to distinguish a clean finish from a deadlock.
-    // Live processes: scheduled but not yet completed. Completion drops the slot.
     pub(crate) fn pending(&self) -> usize {
         self.processes.iter().filter(|p| p.is_some()).count()
     }
@@ -81,32 +80,32 @@ impl<'a> Executor<'a> {
     /// Runs the poll loop until the run queue drains, returning the first process
     /// error as a [`RawProcessError`]. Does not detect deadlock — the strategy
     /// does, by comparing [`pending`](Self::pending) against the enabled set.
-    // Polls runnable processes until the queue drains, promoting woken
-    // processes before each poll. The leading flush picks up wakes that
-    // arrived between calls (e.g. the strategy committing a transition).
     pub(crate) fn execute(&mut self) -> Result<(), RawProcessError> {
         loop {
+            // The leading flush also picks up wakes that arrived between calls
+            // (e.g. the strategy committing a transition).
             self.flush_wakes();
             let Some(id) = self.queue.pop_front() else {
-                break;
+                return Ok(());
             };
-            let poll = {
-                let _guard = Guard::enter(id);
-                // Disjoint field borrows: the waker for the Context, the future
-                // to poll — so no clone is needed.
-                let process = self.processes[id].as_mut().unwrap();
-                process
-                    .future
-                    .as_mut()
-                    .poll(&mut Context::from_waker(&process.waker))
-            };
-            match poll {
+            match self.poll(id) {
                 Poll::Ready(Ok(())) => self.processes[id] = None,
                 Poll::Ready(Err(e)) => return Err(RawProcessError { pid: id, source: e }),
                 Poll::Pending => {}
             }
         }
-        Ok(())
+    }
+
+    // Polls one process once, with `pid()` set to it for the duration of the poll.
+    fn poll(&mut self, id: ProcessID) -> Poll<process::ProcessResult> {
+        let _guard = Guard::enter(id);
+        // Disjoint field borrows: the waker for the Context, the future to poll —
+        // so no clone is needed.
+        let process = self.processes[id].as_mut().unwrap();
+        process
+            .future
+            .as_mut()
+            .poll(&mut Context::from_waker(&process.waker))
     }
 
     // Moves woken processes back onto the queue. Promotes in ascending-pid order
@@ -170,8 +169,6 @@ pub(crate) fn pid() -> ProcessID {
 ///
 /// `World::named_error` promotes this into the public, name-bearing
 /// [`ProcessError`](super::ProcessError).
-// The executor only knows process ids, so its failure carries the raw pid.
-// `World::named_error` promotes this into the public, name-bearing `ProcessError`.
 #[derive(Debug)]
 pub(crate) struct RawProcessError {
     pub(crate) pid: ProcessID,
