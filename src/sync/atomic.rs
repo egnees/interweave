@@ -39,14 +39,12 @@ struct Request<T> {
     transition: Transition,
     waker: Waker,
     op: Op<T>,
-    // The commit writes the observed (previous) value here for the future to
-    // read back on its next poll.
+    // The commit writes the observed (previous) value here; the future reads it back to resolve
+    // its `.await`.
     result: Rc<Cell<Option<T>>>,
 }
 
-// One committed op, kept so `label` and `op_of` can resolve it after the fact.
-// `prev` is the value observed at commit time; for a store it is also what was
-// overwritten.
+// `prev` is the value observed at commit time; for a store it is also what was overwritten.
 struct Record<T> {
     transition: Transition,
     op: Op<T>,
@@ -87,21 +85,18 @@ impl<T: Copy + PartialEq + Debug> Atomic<T> {
         });
     }
 
-    // Commits one pending op: a store (or a matching compare-exchange) writes
-    // the new value, every op observes the value present just before it.
+    // Commits one pending op: a store (or a matching compare-exchange) writes the new value, every
+    // op observes the value present just before it.
     fn apply(&mut self, t: Transition) {
-        let i = self
-            .requests
-            .iter()
-            .position(|r| r.transition == t)
-            .expect("transition must be enabled");
+        let Some(i) = self.requests.iter().position(|r| r.transition == t) else {
+            panic!("transition must be enabled");
+        };
         let req = self.requests.remove(i);
         let prev = self.value;
         match req.op {
             Op::Store(new) => self.value = new,
-            Op::Load => {}
             Op::CompareExchange { current, new } if prev == current => self.value = new,
-            Op::CompareExchange { .. } => {}
+            Op::Load | Op::CompareExchange { .. } => {}
         }
         self.history.push(Record {
             transition: t,
@@ -116,37 +111,31 @@ impl<T: Copy + PartialEq + Debug> Atomic<T> {
         self.requests.iter().map(|r| r.transition).collect()
     }
 
-    // Resolves a transition's op whether it is still pending or already
-    // committed. DPOR asks about a past transition (in `history`) against a
-    // process's next op (still in `requests`), so both vectors must be searched.
+    // Resolves a transition's op whether it is still pending or already committed. DPOR asks about
+    // a past transition (in `history`) against a process's next op (still in `requests`), so both
+    // vectors must be searched.
     fn op_of(&self, t: Transition) -> Op<T> {
-        self.requests
-            .iter()
-            .find(|r| r.transition == t)
-            .map(|r| r.op)
-            .or_else(|| {
-                self.history
-                    .iter()
-                    .find(|r| r.transition == t)
-                    .map(|r| r.op)
-            })
+        let pending = self.requests.iter().map(|r| (r.transition, r.op));
+        let committed = self.history.iter().map(|r| (r.transition, r.op));
+        pending
+            .chain(committed)
+            .find(|(transition, _)| *transition == t)
+            .map(|(_, op)| op)
             .expect("transition not registered on this atomic")
     }
 
-    // Two ops on the same atomic conflict unless both are loads: loads commute
-    // (each observes the same value, neither writes). A store always writes; a
-    // CAS may write, and the op kind alone cannot rule that out, so it counts as
-    // a write unconditionally — a sound (never under-approximating) choice.
+    // Two ops on the same atomic conflict unless both are loads: loads commute (each observes the
+    // same value, neither writes). A store always writes; a CAS may write, and the op kind alone
+    // cannot rule that out, so it counts as a write unconditionally — a sound (never
+    // under-approximating) choice.
     fn depends(&self, t1: Transition, t2: Transition) -> bool {
         !(self.op_of(t1).is_load() && self.op_of(t2).is_load())
     }
 
     fn label(&self, t: &Transition) -> String {
-        let rec = self
-            .history
-            .iter()
-            .find(|r| r.transition == *t)
-            .expect("label called on an unapplied transition");
+        let Some(rec) = self.history.iter().find(|r| r.transition == *t) else {
+            panic!("label called on an unapplied transition");
+        };
         match rec.op {
             Op::Store(new) => format!("store {new:?} (was {:?})", rec.prev),
             Op::Load => format!("load -> {:?}", rec.prev),
@@ -214,22 +203,23 @@ impl<T: Copy + PartialEq + Debug> Handle<T> {
         if prev == current { Ok(prev) } else { Err(prev) }
     }
 
-    // First poll registers the op and yields so the strategy can pick it; the
-    // commit fills `result` and wakes us, and the next poll reads it back. A
-    // spurious poll before the commit finds `result` empty and stays pending.
+    // First poll registers the op and yields so the strategy can pick it; the commit fills `result`
+    // and wakes us, and the next poll reads it back. A spurious poll before the commit finds
+    // `result` empty and stays pending. `op.take()` registers at most once, so re-polling while
+    // pending does not register a second op.
     async fn request(&self, op: Op<T>) -> T {
         let result = Rc::new(Cell::new(None));
         let mut op = Some(op);
-        poll_fn(move |cx| match result.get() {
-            Some(value) => Poll::Ready(value),
-            None => {
-                if let Some(op) = op.take() {
-                    self.atomic
-                        .borrow_mut()
-                        .register(op, cx.waker().clone(), Rc::clone(&result));
-                }
-                Poll::Pending
+        poll_fn(move |cx| {
+            if let Some(value) = result.get() {
+                return Poll::Ready(value);
             }
+            if let Some(op) = op.take() {
+                self.atomic
+                    .borrow_mut()
+                    .register(op, cx.waker().clone(), Rc::clone(&result));
+            }
+            Poll::Pending
         })
         .await
     }
@@ -259,9 +249,9 @@ mod tests {
     use crate::model::Executor;
     use std::cell::Cell;
 
-    // Drives the strategy by hand: keep committing the first enabled transition
-    // and resuming the executor until the process finishes. `apply` needs
-    // `&mut Handle`, but the state lives behind an `Rc`, so any clone works.
+    // Drives the strategy by hand: keep committing the first enabled transition and resuming the
+    // executor until the process finishes. `apply` needs `&mut Handle`, but the state lives behind
+    // an `Rc`, so any clone works.
     fn drive(exec: &mut Executor, obj: &mut impl Object) {
         exec.execute().unwrap();
         while let Some(&t) = obj.enabled().first() {
@@ -329,9 +319,9 @@ mod tests {
         assert_eq!(after.get(), 9);
     }
 
-    // The defining RMW property: the compare happens at commit, not at
-    // registration. Another process stores between this CAS's registration and
-    // its commit, so the CAS sees the fresh value and reports the mismatch.
+    // The defining RMW property: the compare happens at commit, not at registration. Another
+    // process stores between this CAS's registration and its commit, so the CAS sees the fresh
+    // value and reports the mismatch.
     #[test]
     fn compare_exchange_observes_commit_time_value() {
         let a = Handle::new(0, 1u32);
