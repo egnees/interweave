@@ -2,6 +2,17 @@
 name = "interweave"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Stateless model checker for concurrent programs: watch Optimal DPOR explore interleavings of async processes on a deterministic from-scratch executor."
+documentation = "https://docs.rs/interweave"
+repository = "https://github.com/egnees/interweave"
+homepage = "https://github.com/egnees/interweave"
+readme = "README.md"
+license = "MIT"
+keywords = ["dpor", "model-checking", "concurrency", "interleaving", "stateless"]
+categories = ["concurrency", "simulation", "development-tools::testing"]
+authors = ["Sergei Yakovlev <3gnees@gmail.com>"]
+exclude = ["/web", "/refs", "/.claude", "/.github"]
 
 [dependencies]
 thiserror = "2"
