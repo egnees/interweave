@@ -341,18 +341,23 @@ impl<'a> State<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FailureReason, State, World};
+    use super::{FailureReason, State, Transition, World};
 
+    const WRITER: usize = 0;
+    const READER: usize = 1;
+
+    // A writer storing 222 and a reader that only succeeds if it observes that
+    // store, so the two scheduling orders give a clean run vs. a process failure.
     fn program(world: &mut World) {
         let atomic = world.atomic("x", 123);
-        let r1 = atomic.clone();
-        let r2 = atomic.clone();
+        let writer = atomic.clone();
+        let reader = atomic;
         world.spawn("writer", async move {
-            r1.store(222).await;
+            writer.store(222).await;
             Ok(())
         });
         world.spawn("reader", async move {
-            if r2.load().await == 222 {
+            if reader.load().await == 222 {
                 Ok(())
             } else {
                 Err("unexpected value".into())
@@ -360,25 +365,26 @@ mod tests {
         });
     }
 
+    fn enabled_op(state: &State, pid: usize) -> Transition {
+        *state.enabled().iter().find(|t| t.pid == pid).unwrap()
+    }
+
     #[test]
     fn store_then_load() {
         let mut state = State::new(&program);
-        let enabled = state.enabled();
-        let p1 = *enabled.iter().find(|t| t.pid == 0).unwrap();
-        let p2 = *enabled.iter().find(|t| t.pid == 1).unwrap();
-        state.apply(p1);
-        state.apply(p2);
+        state.apply(enabled_op(&state, WRITER));
+        state.apply(enabled_op(&state, READER));
         assert!(state.enabled().is_empty());
         assert!(state.failure_reason().is_none());
     }
 
     // Loading before the store leaves the reader observing the initial value and
-    // erroring; the state reports the failure, and the failing op's label is
-    // still resolvable because `apply` records history before the process polls.
+    // erroring; the failing op's label is still resolvable because `apply` records
+    // history before the process polls.
     #[test]
     fn load_then_store_records_failure() {
         let mut state = State::new(&program);
-        let load = *state.enabled().iter().find(|t| t.pid == 1).unwrap();
+        let load = enabled_op(&state, READER);
         state.apply(load);
         assert!(matches!(
             state.failure_reason(),

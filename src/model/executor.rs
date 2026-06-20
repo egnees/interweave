@@ -195,6 +195,8 @@ mod tests {
         assert!(matches!(err, RawProcessError { pid: 0, .. }));
     }
 
+    // A process that wakes itself while returning Pending must be re-queued and
+    // polled again rather than dropped: the run must still terminate cleanly.
     #[test]
     fn self_yield() {
         let mut exec = Executor::default();
