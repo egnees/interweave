@@ -1,3 +1,12 @@
+//! The deterministic, single-threaded driver underneath the model.
+//!
+//! The executor is deliberately *dumb*: it owns the process futures and their
+//! wakers and runs whichever process is runnable, in a replay-stable FIFO order.
+//! It makes no scheduling *decisions* — all interleaving control lives in the
+//! synchronization primitives (via wakers) and the strategy layer above. Given
+//! the same processes and the same wake pattern it produces an identical
+//! execution, which is what lets the strategy replay prefixes.
+
 use std::{
     cell::Cell,
     collections::VecDeque,
@@ -7,7 +16,7 @@ use std::{
     task::{Context, Poll, Wake, Waker},
 };
 
-use crate::process::{self, ProcessID};
+use super::process::{self, ProcessID};
 
 struct Process<'a> {
     future: Pin<Box<dyn Future<Output = process::ProcessResult> + 'a>>,
@@ -34,6 +43,8 @@ impl Wake for ProcessWaker {
     }
 }
 
+/// The single-threaded process driver: a process table indexed by [`ProcessID`],
+/// a FIFO run queue, and a shared inbox of woken process ids.
 pub(crate) struct Executor<'a> {
     processes: Vec<Option<Process<'a>>>,
     queue: VecDeque<ProcessID>,
@@ -41,6 +52,8 @@ pub(crate) struct Executor<'a> {
 }
 
 impl<'a> Executor<'a> {
+    /// Registers a process future, returning its [`ProcessID`] (== its push index),
+    /// and enqueues it as runnable.
     pub(crate) fn schedule(
         &mut self,
         code: impl Future<Output = process::ProcessResult> + 'a,
@@ -58,15 +71,20 @@ impl<'a> Executor<'a> {
         id
     }
 
+    /// Number of live processes: scheduled but not yet completed (completion drops
+    /// the slot). Used to distinguish a clean finish from a deadlock.
     // Live processes: scheduled but not yet completed. Completion drops the slot.
     pub(crate) fn pending(&self) -> usize {
         self.processes.iter().filter(|p| p.is_some()).count()
     }
 
-    /// Polls runnable processes until the queue drains, promoting woken
-    /// processes before each poll. The leading flush picks up wakes that
-    /// arrived between calls (e.g. the strategy committing a transition).
-    pub(crate) fn execute(&mut self) -> Result<(), ProcessError> {
+    /// Runs the poll loop until the run queue drains, returning the first process
+    /// error as a [`RawProcessError`]. Does not detect deadlock — the strategy
+    /// does, by comparing [`pending`](Self::pending) against the enabled set.
+    // Polls runnable processes until the queue drains, promoting woken
+    // processes before each poll. The leading flush picks up wakes that
+    // arrived between calls (e.g. the strategy committing a transition).
+    pub(crate) fn execute(&mut self) -> Result<(), RawProcessError> {
         loop {
             self.flush_wakes();
             let Some(id) = self.queue.pop_front() else {
@@ -84,7 +102,7 @@ impl<'a> Executor<'a> {
             };
             match poll {
                 Poll::Ready(Ok(())) => self.processes[id] = None,
-                Poll::Ready(Err(e)) => return Err(ProcessError { pid: id, source: e }),
+                Poll::Ready(Err(e)) => return Err(RawProcessError { pid: id, source: e }),
                 Poll::Pending => {}
             }
         }
@@ -138,17 +156,26 @@ impl Drop for Guard {
     }
 }
 
+/// The [`ProcessID`] of the process currently being polled.
+///
+/// This is the hook synchronization primitives use to stamp [`Transition`](super::Transition)s
+/// with their operating process. Panics if called outside an executor poll.
 pub(crate) fn pid() -> ProcessID {
     CURRENT
         .with(Cell::get)
         .expect("pid() called outside an executor poll")
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("process {pid} failed: {source}")]
-pub(crate) struct ProcessError {
+/// A process error carrying only the raw [`ProcessID`], as known to the executor.
+///
+/// `World::named_error` promotes this into the public, name-bearing
+/// [`ProcessError`](super::ProcessError).
+// The executor only knows process ids, so its failure carries the raw pid.
+// `World::named_error` promotes this into the public, name-bearing `ProcessError`.
+#[derive(Debug)]
+pub(crate) struct RawProcessError {
     pub(crate) pid: ProcessID,
-    source: Box<dyn Error>,
+    pub(crate) source: Box<dyn Error>,
 }
 
 #[cfg(test)]
@@ -168,7 +195,7 @@ mod tests {
         let mut exec = Executor::default();
         exec.schedule(async { Err("boom".into()) });
         let err = exec.execute().unwrap_err();
-        assert!(matches!(err, ProcessError { pid: 0, .. }));
+        assert!(matches!(err, RawProcessError { pid: 0, .. }));
     }
 
     #[test]

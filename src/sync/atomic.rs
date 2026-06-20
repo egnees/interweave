@@ -1,19 +1,38 @@
+//! An atomic cell whose load / store / compare-exchange operations are `.await` yield points.
+//!
+//! [`Handle`] (re-exported as [`Atomic`](crate::Atomic)) is a cloneable handle to a shared
+//! atomic cell. Every operation registers itself with the cell on its first poll and then
+//! yields control back to the executor, so the search strategy can decide *when* it commits
+//! relative to other processes' operations on the same cell. Each commit is therefore a distinct
+//! scheduling point with a [`Transition`] the model checker can reorder.
+//!
+//! Operations are split into registration and commit: registration records the intended op and
+//! its waker; commit (driven by the strategy via [`Object::apply`]) reads the value present at
+//! that moment, applies any write, and wakes the process so it can read the observed value back.
+//! This is what makes a compare-exchange evaluate its comparison at *commit* time rather than at
+//! registration time.
+
 use std::{
     cell::{Cell, RefCell},
+    fmt::Debug,
     future::poll_fn,
     rc::Rc,
     task::{Poll, Waker},
 };
 
-use crate::{
-    executor::pid,
-    object::{Object, ObjectID, Transition},
-};
+use crate::model::{Object, ObjectID, Transition, pid};
 
+#[derive(Clone, Copy)]
 enum Op<T> {
     Store(T),
     Load,
     CompareExchange { current: T, new: T },
+}
+
+impl<T> Op<T> {
+    fn is_load(&self) -> bool {
+        matches!(self, Op::Load)
+    }
 }
 
 struct Request<T> {
@@ -25,20 +44,30 @@ struct Request<T> {
     result: Rc<Cell<Option<T>>>,
 }
 
+// One committed op, kept so `label` and `op_of` can resolve it after the fact.
+// `prev` is the value observed at commit time; for a store it is also what was
+// overwritten.
+struct Record<T> {
+    transition: Transition,
+    op: Op<T>,
+    prev: T,
+}
+
 struct Atomic<T> {
     value: T,
     id: ObjectID,
     requests: Vec<Request<T>>,
-    // Registration counter; stamps each request's `Transition::seq`.
+    history: Vec<Record<T>>,
     seq: usize,
 }
 
-impl<T: Copy + PartialEq> Atomic<T> {
+impl<T: Copy + PartialEq + Debug> Atomic<T> {
     fn new(id: ObjectID, value: T) -> Self {
         Self {
             value,
             id,
             requests: Vec::new(),
+            history: Vec::new(),
             seq: 0,
         }
     }
@@ -74,6 +103,11 @@ impl<T: Copy + PartialEq> Atomic<T> {
             Op::CompareExchange { current, new } if prev == current => self.value = new,
             Op::CompareExchange { .. } => {}
         }
+        self.history.push(Record {
+            transition: t,
+            op: req.op,
+            prev,
+        });
         req.result.set(Some(prev));
         req.waker.wake();
     }
@@ -81,31 +115,100 @@ impl<T: Copy + PartialEq> Atomic<T> {
     fn enabled(&self) -> Vec<Transition> {
         self.requests.iter().map(|r| r.transition).collect()
     }
+
+    // Resolves a transition's op whether it is still pending or already
+    // committed. DPOR asks about a past transition (in `history`) against a
+    // process's next op (still in `requests`), so both vectors must be searched.
+    fn op_of(&self, t: Transition) -> Op<T> {
+        self.requests
+            .iter()
+            .find(|r| r.transition == t)
+            .map(|r| r.op)
+            .or_else(|| {
+                self.history
+                    .iter()
+                    .find(|r| r.transition == t)
+                    .map(|r| r.op)
+            })
+            .expect("transition not registered on this atomic")
+    }
+
+    // Two ops on the same atomic conflict unless both are loads: loads commute
+    // (each observes the same value, neither writes). A store always writes; a
+    // CAS may write, and the op kind alone cannot rule that out, so it counts as
+    // a write unconditionally — a sound (never under-approximating) choice.
+    fn depends(&self, t1: Transition, t2: Transition) -> bool {
+        !(self.op_of(t1).is_load() && self.op_of(t2).is_load())
+    }
+
+    fn label(&self, t: &Transition) -> String {
+        let rec = self
+            .history
+            .iter()
+            .find(|r| r.transition == *t)
+            .expect("label called on an unapplied transition");
+        match rec.op {
+            Op::Store(new) => format!("store {new:?} (was {:?})", rec.prev),
+            Op::Load => format!("load -> {:?}", rec.prev),
+            Op::CompareExchange { current, new } if rec.prev == current => {
+                format!("cas({current:?}->{new:?}) ok")
+            }
+            Op::CompareExchange { current, new } => {
+                format!("cas({current:?}->{new:?}) fail: {:?}", rec.prev)
+            }
+        }
+    }
 }
 
+/// A cloneable handle to a shared atomic cell.
+///
+/// Clones share the same underlying cell, so handing a clone to each process gives them a common
+/// atomic to operate on. Re-exported from the crate root as [`Atomic`](crate::Atomic).
+///
+/// Every operation ([`store`](Handle::store), [`load`](Handle::load),
+/// [`compare_exchange`](Handle::compare_exchange)) is an `async` method: awaiting it registers the
+/// operation and yields, turning the commit into a [`Transition`] the search strategy schedules
+/// against other processes' operations on the same cell.
 #[derive(Clone)]
-pub struct Handle<T: Copy + PartialEq> {
+pub struct Handle<T: Copy + PartialEq + Debug> {
     atomic: Rc<RefCell<Atomic<T>>>,
 }
 
-impl<T: Copy + PartialEq> Handle<T> {
+impl<T: Copy + PartialEq + Debug> Handle<T> {
     pub(crate) fn new(id: ObjectID, value: T) -> Self {
         Self {
             atomic: Rc::new(RefCell::new(Atomic::new(id, value))),
         }
     }
 
-    /// Returns the previous value.
+    /// Writes `value` into the cell, returning the value it overwrote.
+    ///
+    /// Awaiting this is a scheduling point: the write commits when the strategy selects this
+    /// operation's [`Transition`], and the returned value is whatever the cell held just before
+    /// the commit.
     pub async fn store(&self, value: T) -> T {
         self.request(Op::Store(value)).await
     }
 
+    /// Reads the cell's current value without modifying it.
+    ///
+    /// Awaiting this is a scheduling point: the read commits when the strategy selects this
+    /// operation's [`Transition`], and the returned value is whatever the cell holds at that
+    /// moment. Two loads on the same cell are independent (they commute), so the search layer need
+    /// not reorder them against each other.
     pub async fn load(&self) -> T {
         self.request(Op::Load).await
     }
 
-    /// Stores `new` if the value still equals `current`. Returns the value seen
-    /// at commit: `Ok(current)` if the swap happened, `Err(actual)` otherwise.
+    /// Stores `new` if, at commit time, the cell still equals `current`.
+    ///
+    /// The comparison happens at *commit* time, not when the operation is awaited, so an
+    /// intervening store from another process is observed. Returns the value seen at commit:
+    /// `Ok(current)` if the swap happened, `Err(actual)` otherwise.
+    ///
+    /// Awaiting this is a scheduling point, and the operation is treated as a potential write
+    /// (hence dependent with other writes and loads) regardless of whether the swap ultimately
+    /// succeeds.
     pub async fn compare_exchange(&self, current: T, new: T) -> Result<T, T> {
         let prev = self.request(Op::CompareExchange { current, new }).await;
         if prev == current { Ok(prev) } else { Err(prev) }
@@ -132,7 +235,7 @@ impl<T: Copy + PartialEq> Handle<T> {
     }
 }
 
-impl<T: Copy + PartialEq + 'static> Object for Handle<T> {
+impl<T: Copy + PartialEq + Debug + 'static> Object for Handle<T> {
     fn apply(&mut self, t: Transition) {
         self.atomic.borrow_mut().apply(t);
     }
@@ -140,12 +243,20 @@ impl<T: Copy + PartialEq + 'static> Object for Handle<T> {
     fn enabled(&self) -> Vec<Transition> {
         self.atomic.borrow().enabled()
     }
+
+    fn label(&self, t: &Transition) -> String {
+        self.atomic.borrow().label(t)
+    }
+
+    fn depends(&self, t1: Transition, t2: Transition) -> bool {
+        self.atomic.borrow().depends(t1, t2)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::Executor;
+    use crate::model::Executor;
     use std::cell::Cell;
 
     // Drives the strategy by hand: keep committing the first enabled transition
