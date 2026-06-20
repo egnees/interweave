@@ -1,4 +1,12 @@
 /target
 
-# Machine-local Claude Code settings (agent definitions are tracked).
-/.claude/settings.local.json
+# Local Claude Code configuration (agents, skills, settings).
+/.claude/
+
+# macOS Finder metadata.
+.DS_Store
+
+# Scratch report artifacts. The golden report is web/public/report.json; these
+# root-level dumps are throwaway and must not be tracked.
+/report.json
+/2atomics.json
