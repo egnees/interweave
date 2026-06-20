@@ -43,16 +43,14 @@ pub fn explore<'a>(
     }
 }
 
-// Visits one state: the observer always sees it first (failed states included,
-// so it can read `failure_reason` and resolve the failing transition), then a
-// failed state ends its branch and aborts the search at the first such failure.
+// The observer sees every state first — failed ones included — so it can read the failure reason
+// and resolve the failing transition before a failed branch aborts the search.
 fn dfs<'a>(state: State<'a>, observer: &mut impl Observer) -> Result<(), FailedState<'a>> {
     observer.observe(&state);
     if state.is_failed() {
-        let (reason, view) = state.into_failure();
-        return Err(FailedState::new(reason, view));
+        return Err(FailedState::from_state(state));
     }
-    // An empty `enabled` with no failure is a clean terminal: every process done.
+    // An empty `enabled` with no failure is a clean terminal: every process is done.
     for t in state.enabled() {
         let mut next = state.fork();
         next.apply(t);
@@ -77,6 +75,12 @@ impl<'a> FailedState<'a> {
         Self { reason, view }
     }
 
+    // Splits a failed state into its reason and a replayable view of the prefix that reached it.
+    fn from_state(state: State<'a>) -> Self {
+        let (reason, view) = state.into_failure();
+        Self::new(reason, view)
+    }
+
     /// The reason this interleaving failed — a process error or a deadlock.
     pub fn reason(&self) -> &FailureReason {
         &self.reason
@@ -88,9 +92,7 @@ impl<'a> FailedState<'a> {
     /// [`FailedState`]. This demonstrates that the discovered schedule is deterministically
     /// reproducible.
     pub fn play(&self) -> Self {
-        let replayed = self.view.state();
-        let (reason, view) = replayed.into_failure();
-        Self::new(reason, view)
+        Self::from_state(self.view.state())
     }
 }
 
