@@ -122,19 +122,20 @@ mod tests {
     use super::{Strategy, explore};
     use crate::model::World;
 
+    // A writer racing a reader on one atomic: the reader errors unless the store commits first, so
+    // some interleaving fails. Used to check that a discovered failure replays identically.
     fn racy(world: &mut World) {
-        let atomic = world.atomic("x", 0u32);
-        let r1 = atomic.clone();
-        let r2 = atomic.clone();
+        let x = world.atomic("x", 0u32);
+        let writer = x.clone();
+        let reader = x.clone();
         world.spawn("writer", async move {
-            r1.store(1).await;
+            writer.store(1).await;
             Ok(())
         });
         world.spawn("reader", async move {
-            if r2.load().await == 1 {
-                Ok(())
-            } else {
-                Err("unexpected value".into())
+            match reader.load().await {
+                1 => Ok(()),
+                _ => Err("unexpected value".into()),
             }
         });
     }
@@ -146,17 +147,18 @@ mod tests {
         assert_eq!(failed.to_string(), again.to_string());
     }
 
-    // Two independent stores on one atomic: every interleaving runs cleanly.
+    // Two independent stores on one atomic: nothing reads the value back, so every interleaving
+    // terminates cleanly.
     fn two_writers(world: &mut World) {
-        let atomic = world.atomic("x", 0u32);
-        let r1 = atomic.clone();
-        let r2 = atomic.clone();
+        let x = world.atomic("x", 0u32);
+        let first = x.clone();
+        let second = x.clone();
         world.spawn("writer-1", async move {
-            r1.store(1).await;
+            first.store(1).await;
             Ok(())
         });
         world.spawn("writer-2", async move {
-            r2.store(2).await;
+            second.store(2).await;
             Ok(())
         });
     }
@@ -166,7 +168,8 @@ mod tests {
         assert!(explore(&two_writers, &mut (), Strategy::Dfs).is_ok());
     }
 
-    // A process that never makes progress: blocked with nothing enabled.
+    // A lone process blocked forever: nothing is enabled yet it never completes, which the search
+    // must report as a deadlock.
     fn never_finishes(world: &mut World) {
         world.spawn("stuck", async {
             std::future::pending::<()>().await;
