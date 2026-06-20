@@ -46,12 +46,13 @@ explore(&program, &mut (), Strategy::Optimal).expect("no interleaving fails");
 
 Runnable examples live in [`examples/`](examples):
 
-- `find_bug` — the checker pinning down a write-write race.
+- `bank` — the checker finding a non-atomic money-transfer bug (a dirty/torn
+  read that breaks an `a + b == const` invariant).
 - `readers` / `lastzero` / `indexer` — reproduce the POPL'14 Optimal-DPOR
   benchmark counts (one maximal trace per Mazurkiewicz class).
 
 ```sh
-cargo run --example find_bug
+cargo run --example bank
 cargo run --release --example lastzero 6
 ```
 

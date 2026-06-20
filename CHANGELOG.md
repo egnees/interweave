@@ -14,7 +14,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `explore` entry point with two strategies: naive exhaustive `Strategy::Dfs` and
   `Strategy::Optimal` (Optimal DPOR, Abdulla et al., POPL'14).
 - `Observer` hook called at every explored state (`&mut ()` to observe nothing).
-- Examples: `find_bug`, and `readers` / `lastzero` / `indexer` reproducing the
-  POPL'14 Optimal-DPOR benchmark counts.
+- Examples: `bank` (the checker finding a non-atomic transfer bug), and
+  `readers` / `lastzero` / `indexer` reproducing the POPL'14 Optimal-DPOR
+  benchmark counts.
 
 [Unreleased]: https://github.com/egnees/interweave/commits/master
