@@ -113,26 +113,12 @@ pub(super) fn run<'a>(
     let mut need_replay = false;
 
     loop {
+        // An empty wut node means this frame is fully explored. Popping it past the
+        // root means the whole search is done.
         if node_at(&tree, &cursor).children.is_empty() {
-            // This frame's wakeup tree is exhausted: it is fully explored. Pop it; in
-            // the parent drop the finished branch and sleep its head.
-            frames.pop();
-            let Some(&finished_t) = prefix.last() else {
-                // Popped the root: done.
+            if pop_exhausted(&mut tree, &mut frames, &mut prefix, &mut cursor) {
                 return Ok(());
-            };
-            let finished = finished_t.pid;
-            prefix.pop();
-            cursor.pop();
-            let parent = node_at_mut(&mut tree, &cursor);
-            debug_assert_eq!(
-                parent.children.first().map(|(t, _)| t.pid),
-                Some(finished),
-                "the finished branch must be the ≺-minimal child"
-            );
-            parent.children.remove(0);
-            // Algorithm 2 line 17: the parent now sleeps the fully-explored head.
-            frames.last_mut().unwrap().sleep.push(finished);
+            }
             need_replay = true;
             continue;
         }
@@ -152,21 +138,10 @@ pub(super) fn run<'a>(
             "a committed op must be enabled"
         );
 
-        // Sleep' = { q ∈ sleep(E) | next(q) independent of p's step } — on the LIVE
-        // `cur`, captured BEFORE the in-place apply below (the single ordering
-        // hazard of replay-once: snapshot the parent before stepping past it). The
-        // parent's sleep may have been grown by line-17 pops, so read it live.
-        let child_sleep: Vec<usize> = frames
-            .last()
-            .unwrap()
-            .sleep
-            .iter()
-            .copied()
-            .filter(|&q| match resolve(&cur, q) {
-                Some(q_t) => !cur.depends(p_t, q_t),
-                None => false,
-            })
-            .collect();
+        // Sleep' for the child, computed on the LIVE `cur` BEFORE the in-place apply
+        // below — the single ordering hazard of replay-once: the parent must be
+        // snapshot before stepping past it.
+        let child_sleep = child_sleep_set(&cur, frames.last().unwrap(), p_t);
 
         cur.apply(p_t);
         observer.observe(&cur);
@@ -196,20 +171,66 @@ pub(super) fn run<'a>(
             );
             need_replay = true;
         } else {
-            // Seed the child if a race did not already plant a fragment here.
-            let child_sleep = &frames.last().unwrap().sleep;
-            if node_at(&tree, &cursor).children.is_empty()
-                && let Some(q) = seed(&cur, child_sleep)
-            {
-                debug_assert!(
-                    !child_sleep.contains(&q),
-                    "sleep-set-blocked state under Optimal DPOR"
-                );
-                let q_t = resolve(&cur, q).expect("a seeded process must be runnable");
-                node_at_mut(&mut tree, &cursor).graft(&[q_t]);
-            }
+            seed_child(&mut tree, &cursor, &cur, &frames.last().unwrap().sleep);
         }
     }
+}
+
+// Pops the exhausted top frame: drops the finished (≺-minimal) branch in the parent
+// and sleeps its head (Algorithm 2 line 17). Returns `true` when the popped frame
+// was the root, i.e. the whole search is done.
+fn pop_exhausted(
+    tree: &mut Wut,
+    frames: &mut Vec<Frame>,
+    prefix: &mut Vec<Transition>,
+    cursor: &mut Vec<usize>,
+) -> bool {
+    frames.pop();
+    let Some(finished_t) = prefix.pop() else {
+        return true;
+    };
+    let finished = finished_t.pid;
+    cursor.pop();
+    let parent = node_at_mut(tree, cursor);
+    debug_assert_eq!(
+        parent.children.first().map(|(t, _)| t.pid),
+        Some(finished),
+        "the finished branch must be the ≺-minimal child"
+    );
+    parent.children.remove(0);
+    frames.last_mut().unwrap().sleep.push(finished);
+    false
+}
+
+// Sleep' = { q ∈ sleep(E) | next(q) independent of p's step }. The parent's sleep is
+// read live (line-17 pops may have grown it) and each q is resolved against `cur`.
+fn child_sleep_set(cur: &State, parent: &Frame, p_t: Transition) -> Vec<usize> {
+    parent
+        .sleep
+        .iter()
+        .copied()
+        .filter(|&q| match resolve(cur, q) {
+            Some(q_t) => !cur.depends(p_t, q_t),
+            None => false,
+        })
+        .collect()
+}
+
+// Seeds the child's wut with one enabled non-sleeping process — but only if a race
+// did not already plant a fragment there.
+fn seed_child(tree: &mut Wut, cursor: &[usize], cur: &State, child_sleep: &[usize]) {
+    if !node_at(tree, cursor).children.is_empty() {
+        return;
+    }
+    let Some(q) = seed(cur, child_sleep) else {
+        return;
+    };
+    debug_assert!(
+        !child_sleep.contains(&q),
+        "sleep-set-blocked state under Optimal DPOR"
+    );
+    let q_t = resolve(cur, q).expect("a seeded process must be runnable");
+    node_at_mut(tree, cursor).graft(&[q_t]);
 }
 
 // Plans the reversal of every reversible race in the maximal trace `state`: for a
@@ -228,22 +249,29 @@ fn plan_reversals(tree: &mut Wut, frames: &[Frame], trace: &[Transition], state:
             if !reversible_race(state, &clocks, trace, i, j) {
                 continue;
             }
-            // The reversing fragment and the prefix it belongs to (E' = pre(E, e)).
+            // The reversing fragment v = notdep(e, E).proc(e') and the prefix E' =
+            // pre(E, e) it belongs to (frames[i-1]).
             let mut v = notdep(&clocks, trace, i);
             v.push(trace[j - 1]);
             let pre = &frames[i - 1];
-            // Guard: sleep(E') ∩ WI[E'](v) = ∅ — skip if a sleeper already covers v.
-            let covered = pre.sleep.iter().any(|&q| {
-                let q_t = pre.pending.iter().copied().find(|t| t.pid == q);
-                weak_initial(state, q_t, &pre.enabled, &v)
-            });
-            if !covered {
-                // The wut node for prefix trace[..i-1] is at cursor depth i-1
-                // (≺-min descent), so a path of (i-1) zeros.
-                insert(node_at_mut(tree, &vec![0; i - 1]), state, &v);
+            if covered_by_sleeper(state, pre, &v) {
+                continue;
             }
+            // The wut node for prefix trace[..i-1] is at cursor depth i-1 (≺-min
+            // descent), so a path of (i-1) zeros.
+            insert(node_at_mut(tree, &vec![0; i - 1]), state, &v);
         }
     }
+}
+
+// Guard sleep(E') ∩ WI[E'](v) ≠ ∅ (Algorithm 2 line 6): whether a process already
+// asleep at the prefix `pre` is a weak-initial of `v`, in which case the reversal is
+// already covered and must not be re-inserted.
+fn covered_by_sleeper(state: &State, pre: &Frame, v: &[Transition]) -> bool {
+    pre.sleep.iter().any(|&q| {
+        let q_t = pre.pending.iter().copied().find(|t| t.pid == q);
+        weak_initial(state, q_t, &pre.enabled, v)
+    })
 }
 
 // insert[E'](v, wut): descends the branch that is the longest weak-initial prefix
