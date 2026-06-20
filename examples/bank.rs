@@ -19,8 +19,6 @@
 //! cargo run --example bank
 //! ```
 
-use std::error::Error;
-
 use interweave::{Strategy, World, explore};
 
 const TOTAL: i32 = 100;
@@ -53,15 +51,12 @@ fn bank(world: &mut World) {
     });
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() {
     match explore(&bank, &mut (), Strategy::Optimal) {
-        Ok(()) => {
-            println!("no interleaving violates the invariant (unexpected for this program)");
-        }
+        Ok(()) => println!("no interleaving violates the invariant (unexpected for this program)"),
         Err(failed) => {
             println!("found a schedule that breaks the a + b == {TOTAL} invariant:");
             println!("  {failed}");
         }
     }
-    Ok(())
 }
