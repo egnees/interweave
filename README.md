@@ -73,12 +73,6 @@ Runnable examples live in [`examples/`](examples):
 - `readers` / `lastzero` / `indexer` — reproduce the POPL'14 Optimal-DPOR
   benchmark counts (one maximal trace per Mazurkiewicz class).
 
-```sh
-cargo run --example publish
-cargo run --example bank
-cargo run --release --example lastzero 6
-```
-
 ## Layout
 
 Three module layers, dependencies pointing downward (`search → model`, with
@@ -102,14 +96,6 @@ Three module layers, dependencies pointing downward (`search → model`, with
       sleep-set blocking
 - [ ] Channels (blocking, unbounded MPSC)
 - [ ] Visualization of the interleaving tree / happens-before graphs
-
-## Commands
-
-```sh
-cargo test                  # run the tests
-cargo clippy --all-targets  # lint
-cargo +nightly fmt          # rustfmt.toml uses nightly-only options
-```
 
 ## References
 
