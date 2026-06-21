@@ -10,11 +10,10 @@ mod process;
 
 use std::{error::Error, fmt::Debug};
 
-pub use object::Transition;
-pub use process::ProcessResult;
+pub use object::{Object, ObjectID, Transition};
+pub use process::{ProcessID, ProcessResult};
 
 pub(crate) use executor::{Executor, pid};
-pub(crate) use object::{Object, ObjectID};
 
 use crate::sync::Atomic;
 
@@ -51,8 +50,23 @@ impl<'a> World<'a> {
         name: impl Into<String>,
         value: T,
     ) -> Atomic<T> {
+        self.register(name, |id| Atomic::new(id, value))
+    }
+
+    /// Registers a custom synchronization object, returning the cloneable handle
+    /// the program shares among its processes.
+    ///
+    /// `build` receives the [`ObjectID`] the world assigns and returns a handle
+    /// implementing [`Object`]; the world keeps one clone to drive and gives this
+    /// one back. The handle's clones must share state (see [`Object`]). This is the
+    /// open extension point behind [`atomic`](World::atomic) — implement [`Object`]
+    /// for your own lock, channel, or barrier and register it here.
+    pub fn register<O>(&mut self, name: impl Into<String>, build: impl FnOnce(ObjectID) -> O) -> O
+    where
+        O: Object + Clone + 'static,
+    {
         let id = self.objects.len();
-        let handle = Atomic::new(id, value);
+        let handle = build(id);
         self.objects.push(Box::new(handle.clone()));
         self.object_names.push(name.into());
         handle

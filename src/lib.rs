@@ -69,11 +69,22 @@
 //!   point. Currently [`Atomic`].
 //! - **`search`** — the exploration algorithms: [`explore`] dispatches on a [`Strategy`], reports
 //!   the first [`FailedState`], and calls an [`Observer`] at every visited state.
+//!
+//! # Custom synchronization objects
+//!
+//! [`Atomic`] is built on the same public surface you can use yourself: implement the [`Object`]
+//! trait for a from-scratch primitive (a lock, a channel, a barrier) so that each of its
+//! observable operations becomes a [`Transition`] the strategy schedules, then register it with
+//! [`World::register`]. See [`Object`] for the operation lifecycle and the dependency relation that
+//! drives the reduction, and `examples/custom_object.rs` for a tiny worked primitive.
 
 mod model;
 mod search;
 mod sync;
 
-pub use model::{FailureReason, ProcessError, ProcessResult, State, Transition, World};
+pub use model::{
+    FailureReason, Object, ObjectID, ProcessError, ProcessID, ProcessResult, State, Transition,
+    World,
+};
 pub use search::{FailedState, Observer, Strategy, explore};
 pub use sync::Atomic;

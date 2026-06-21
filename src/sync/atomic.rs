@@ -20,7 +20,7 @@ use std::{
     task::{Poll, Waker},
 };
 
-use crate::model::{Object, ObjectID, Transition, pid};
+use crate::model::{Object, ObjectID, Transition};
 
 #[derive(Clone, Copy)]
 enum Op<T> {
@@ -71,11 +71,7 @@ impl<T: Copy + PartialEq + Debug> Atomic<T> {
     }
 
     fn register(&mut self, op: Op<T>, waker: Waker, result: Rc<Cell<Option<T>>>) {
-        let transition = Transition {
-            pid: pid(),
-            oid: self.id,
-            seq: self.seq,
-        };
+        let transition = Transition::new(self.id, self.seq);
         self.seq += 1;
         self.requests.push(Request {
             transition,
