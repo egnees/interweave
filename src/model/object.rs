@@ -16,8 +16,9 @@ pub type ObjectID = usize;
 /// scheduling point.
 ///
 /// It carries the operating process, the target object, and a per-object `seq`
-/// that tells a single process's several concurrent operations on the same object
-/// apart. A custom [`Object`] builds one with [`Transition::new`] when an awaited
+/// that tells the object's several concurrent operations apart — unique per
+/// registration on the object, across all processes. A custom [`Object`] builds one
+/// with [`Transition::new`] when an awaited
 /// operation registers itself, stores it, and hands the same value back from
 /// [`Object::enabled`]; the model later returns it to [`Object::apply`]. Identity
 /// is by value, so an object matches a transition simply with `==`.
@@ -59,8 +60,8 @@ impl Transition {
         self.oid
     }
 
-    /// The per-object sequence number distinguishing one process's concurrent
-    /// operations on the same object.
+    /// The per-object sequence number distinguishing the object's concurrent
+    /// operations; unique per registration on the object, across all processes.
     pub fn seq(&self) -> usize {
         self.seq
     }
