@@ -3,7 +3,8 @@
 //! `interweave` explores the interleavings of concurrent processes and checks
 //! that every one of them is correct. Processes are written as ordinary Rust
 //! [`Future`]s and driven by a custom single-threaded, deterministic executor.
-//! Synchronization primitives ([`Atomic`] today; channels later) are implemented
+//! Synchronization primitives ([`Atomic`] and an MPSC channel: [`Sender`] /
+//! [`Receiver`]) are implemented
 //! from scratch so that every operation that can interact with another process
 //! becomes an explicit scheduling point — an `.await` that hands control back to
 //! the checker. The executor stays deliberately dumb; all interleaving control
@@ -66,7 +67,7 @@
 //!   / [`State`] a program builds, the [`Transition`] the strategy picks, and the [`ProcessError`]
 //!   / [`FailureReason`] verdicts.
 //! - **`sync`** — synchronization primitives whose every observable operation is an `.await` yield
-//!   point. Currently [`Atomic`].
+//!   point: [`Atomic`] and an unbounded MPSC channel ([`Sender`] / [`Receiver`]).
 //! - **`search`** — the exploration algorithms: [`explore`] dispatches on a [`Strategy`], reports
 //!   the first [`FailedState`], and calls an [`Observer`] at every visited state.
 //!
@@ -87,4 +88,4 @@ pub use model::{
     World,
 };
 pub use search::{FailedState, Observer, Strategy, explore};
-pub use sync::Atomic;
+pub use sync::{Atomic, Receiver, Sender};

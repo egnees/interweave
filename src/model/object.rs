@@ -132,6 +132,13 @@ pub trait Object {
     /// `true` only when the operations genuinely interfere (two reads commute; a
     /// write conflicts with reads and writes). Reporting too few dependencies is
     /// *unsound* — it can hide reachable states — so when in doubt, return `true`.
+    ///
+    /// The relation may depend on committed state, not only on the two operations'
+    /// kinds — a channel `recv`, say, conflicts with a `send` only when it consumed
+    /// that send — so the search only ever asks about a pair drawn from one committed
+    /// (maximal or replayed) trace, and the object resolves each operation from its
+    /// own recorded history.
+    ///
     /// Only ever called for two transitions on this same object; the model treats
     /// operations on different objects as independent.
     fn depends(&self, t1: Transition, t2: Transition) -> bool;

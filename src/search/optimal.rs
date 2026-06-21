@@ -11,15 +11,17 @@ use std::collections::BTreeSet;
 
 use super::explore::FailedState;
 use super::observer::Observer;
-use crate::model::{State, Transition};
+use crate::model::{State, StateView, Transition};
 
 // One wakeup-tree node: children in ≺ (sibling) order, `children[0]` the ≺-minimal
 // (explored first); `graft`/`insert` append new branches at the back. Each edge
 // carries its planned transition for dependency tests but is matched by `pid` (the
-// per-object `seq` is not stable across interleavings). On a completed trace
-// `depends` is a pure function of the two ops' kinds, so the carried transitions
-// resolve identically in any state where both occur — that is what lets `insert` /
-// `check_initial` run against the final maximal trace without replaying.
+// per-object `seq` is not stable across interleavings). For atomics `depends` is a
+// pure function of the two ops' kinds, so a carried edge resolves identically in any
+// state where both occur; for channels the send/recv case keys on the recv's
+// consumed send-seq, which drifts across interleavings (a racy upstream op shifts a
+// later send's seq), so `check_initial` re-stamps a carried edge to a live op of the
+// same pid/object before testing it against the current trace.
 #[derive(Default)]
 struct Wut {
     children: Vec<(Transition, Wut)>,
@@ -128,7 +130,7 @@ pub(super) fn run<'a>(
         if cur.enabled().is_empty() {
             // A maximal trace: plan every reversible race's reversal into the
             // ancestor wakeup trees.
-            plan_reversals(&mut tree, &frames, &prefix, &cur);
+            plan_reversals(&mut tree, &frames, &prefix, &cur, &view);
             debug_assert!(
                 node_at(&tree, prefix.len()).children.is_empty(),
                 "a maximal trace's wakeup-tree node has no continuations"
@@ -197,7 +199,13 @@ fn seed_child(tree: &mut Wut, depth: usize, cur: &State, child_sleep: &[usize]) 
 // prefix just before e, unless a process already asleep there covers it.
 // `frames[m]` describes `trace[..m]`, so E' = pre(E, e) for event i (1-based) is
 // `frames[i-1]` and its wut node sits at depth i-1.
-fn plan_reversals(tree: &mut Wut, frames: &[Frame], trace: &[Transition], state: &State) {
+fn plan_reversals(
+    tree: &mut Wut,
+    frames: &[Frame],
+    trace: &[Transition],
+    state: &State,
+    view: &StateView,
+) {
     let n = trace.len();
     let clocks = event_clocks(state, trace);
 
@@ -208,6 +216,14 @@ fn plan_reversals(tree: &mut Wut, frames: &[Frame], trace: &[Transition], state:
             }
             let mut v = notdep(&clocks, trace, i);
             v.push(trace[j - 1]);
+            // Non-disabling check (POPL'14 reversibility): the reversal is only legal if proc(e')
+            // can actually run e' at the reordered prefix. For atomics this always holds (ops never
+            // block); for a consuming send→recv it fails — e' (the recv) needs e (the send) to have
+            // enqueued its message, so removing e disables e'. Done by replay so the strategy stays
+            // primitive-agnostic, asking the model through `enabled` rather than knowing channels.
+            if !runnable_after(view, trace, &v, i) {
+                continue;
+            }
             if covered_by_sleeper(state, &frames[i - 1], &v) {
                 continue;
             }
@@ -218,8 +234,8 @@ fn plan_reversals(tree: &mut Wut, frames: &[Frame], trace: &[Transition], state:
 
 // Algorithm 2 line 6: whether a process already asleep at prefix `pre` is a
 // weak-initial of `v`, in which case the reversal is already covered. `pending` is
-// the enabled set today (atomics never block); once channels land, a blocked recv
-// is pending-but-not-enabled and must be excluded here.
+// `cur.enabled()` captured at `pre`, so a blocked recv is already excluded (it is not
+// enabled) — exactly the set this check needs.
 fn covered_by_sleeper(state: &State, pre: &Frame, v: &[Transition]) -> bool {
     pre.sleep.iter().any(|&q| {
         pre.pending
@@ -249,13 +265,36 @@ fn insert(node: &mut Wut, state: &State, v: &[Transition]) {
     node.graft(v);
 }
 
+// Re-stamp a carried wakeup-tree edge to an op valid in `state`. The edge's seq is
+// the per-object registration index from the interleaving that planted it, which is
+// NOT stable across interleavings (a racy upstream op shifts a later send's seq);
+// only the op-kind, fixed by the node's prefix, is stable. q's relevant op is its
+// first step from that prefix: `v`'s first event of q's pid when present, else (notdep
+// filtered it out) q's matching op still occurs in the live maximal trace.
+fn restamp(state: &State, q_t: Transition, v: &[Transition]) -> Transition {
+    if let Some(&t) = v.iter().find(|t| t.pid == q_t.pid && t.oid == q_t.oid) {
+        return t;
+    }
+    if let Some(&t) = state
+        .trace()
+        .iter()
+        .find(|t| t.pid == q_t.pid && t.oid == q_t.oid)
+    {
+        return t;
+    }
+    q_t // no same-(pid,oid) op in state: no same-oid vk reaches kind_of, so safe.
+}
+
 // Whether `q_t` (q's next op) is a weak-initial of `v`, and if so the residual (v
-// with q's first occurrence removed). Walking v from the front: q is blocked if a
-// v-event it depends on comes first; otherwise q's own occurrence (or independence
-// from all of v) makes it a weak-initial. q's op is stable while stripping events
-// independent of it, and `depends` is evaluated on the maximal `state` where every
-// event resolves — so no replay is needed.
+// with q's first occurrence removed). The leading re-stamp swaps a carried edge for a
+// live op of the same pid/object, since channel seqs drift across interleavings and a
+// stale seq would panic in the channel's `kind_of`. Walking v from the front: q is
+// blocked if a v-event it depends on comes first; otherwise q's own occurrence (or
+// independence from all of v) makes it a weak-initial. q's op is stable while
+// stripping events independent of it, and `depends` is evaluated on the maximal
+// `state` where every event resolves — so no replay is needed.
 fn check_initial(state: &State, q_t: Transition, v: &[Transition]) -> Option<Vec<Transition>> {
+    let q_t = restamp(state, q_t, v);
     for (k, &vk) in v.iter().enumerate() {
         if vk.pid == q_t.pid {
             let mut rest = v.to_vec();
@@ -281,7 +320,8 @@ fn notdep(clocks: &[Vec<usize>], trace: &[Transition], i: usize) -> Vec<Transiti
 
 // Whether (trace[i-1], trace[j-1]) is a reversible race (i < j, 1-based): different
 // processes, dependent, and a *direct* happens-before edge (no causal
-// intermediary).
+// intermediary). The non-disabling side of reversibility is checked separately in
+// `plan_reversals` via `runnable_after` (it needs the candidate reordering `v`).
 fn reversible_race(
     state: &State,
     clocks: &[Vec<usize>],
@@ -295,6 +335,29 @@ fn reversible_race(
     }
     // Direct: no m with e →_E m →_E e' (such m lies strictly between i and j).
     !(i + 1..j).any(|m| happens_before(clocks, trace, i, m) && happens_before(clocks, trace, m, j))
+}
+
+// Whether proc(e') can actually run e' at the reversed prefix, i.e. the reordering
+// `pre(E,e)·notdep` leaves proc(e') enabled (e' = `v`'s last element). Replays
+// `trace[..i-1]` (a valid prefix) then re-resolves the notdep events by pid against
+// the live state — the same pid-driven replay the driver uses, so data-dependent
+// control flow re-resolves correctly — and checks proc(e') is enabled at the end.
+// A no-op for non-blocking primitives (a notdep step always re-resolves and proc(e')
+// stays enabled); it only rejects a reversal whose later event was *enabled by* the
+// event being moved past it (a channel rf edge: removing the send blocks the recv).
+fn runnable_after(view: &StateView, trace: &[Transition], v: &[Transition], i: usize) -> bool {
+    let (ep, notdep) = v.split_last().expect("v ends with e'");
+    let mut state = view.replay(trace[..i - 1].to_vec());
+    for nd in notdep {
+        let Some(t) = resolve(&state, nd.pid) else {
+            return false;
+        };
+        state.apply(t);
+        if state.is_failed() {
+            return false; // the reordering errs before e' — e' can't run.
+        }
+    }
+    state.enabled().iter().any(|t| t.pid == ep.pid)
 }
 
 // i →_E j (event i happens-before event j), for i < j: i ≤ clocks[j][proc(event i)].
@@ -605,6 +668,194 @@ mod tests {
         });
     }
 
+    // Two producers send one value each into one MPSC channel; a consumer recvs both.
+    // The two sends race for queue position (send/send dependent); each recv reads
+    // from whichever send won, so the only freedom is the enqueue order ⇒ 2 classes.
+    fn producer_consumer(world: &mut World) {
+        let (tx, rx) = world.channel::<i32>("ch");
+        let tx2 = tx.clone();
+        world.spawn("producer-1", async move {
+            tx.send(1).await;
+            Ok(())
+        });
+        world.spawn("producer-2", async move {
+            tx2.send(2).await;
+            Ok(())
+        });
+        world.spawn("consumer", async move {
+            rx.recv().await;
+            rx.recv().await;
+            Ok(())
+        });
+    }
+
+    // The reply-misrouting bug from examples/rpc_mux: callers share one connection and
+    // the reader routes by a shared in_flight slot, so a reply can be delivered to the
+    // wrong call when a second caller overwrites the slot first.
+    fn rpc_mux(world: &mut World) {
+        #[derive(Debug, Clone, Copy)]
+        struct Reply {
+            id: i32,
+            result: i32,
+        }
+        let in_flight = world.atomic("in_flight", -1);
+        let (conn, reader) = world.channel::<Reply>("conn");
+        for id in 0..2 {
+            let (in_flight, conn) = (in_flight.clone(), conn.clone());
+            world.spawn(format!("caller-{id}"), async move {
+                in_flight.store(id).await;
+                conn.send(Reply {
+                    id,
+                    result: id * 10,
+                })
+                .await;
+                Ok(())
+            });
+        }
+        world.spawn("reader", async move {
+            for _ in 0..2 {
+                let frame = reader.recv().await;
+                let routed_to = in_flight.load().await;
+                if frame.result != routed_to * 10 {
+                    return Err(format!(
+                        "call {routed_to} received call {}'s result ({})",
+                        frame.id, frame.result
+                    )
+                    .into());
+                }
+            }
+            Ok(())
+        });
+    }
+
+    // Three producers send one value each; the consumer recvs all three. The sends
+    // race for queue position (send/send dependent), so the only freedom is the 3!
+    // enqueue orders ⇒ 6 classes.
+    fn three_producers(world: &mut World) {
+        let (tx, rx) = world.channel::<i32>("ch");
+        for i in 1..=3i32 {
+            let tx = tx.clone();
+            world.spawn(format!("producer-{i}"), async move {
+                tx.send(i).await;
+                Ok(())
+            });
+        }
+        world.spawn("consumer", async move {
+            rx.recv().await;
+            rx.recv().await;
+            rx.recv().await;
+            Ok(())
+        });
+    }
+
+    // Producer-a sends 1 then 2 (program order fixes 1 before 2); producer-b sends 3.
+    // The consumer recvs three times. A Mazurkiewicz class fixes only the consumer's
+    // FIFO value sequence = the linearizations of {1<2, 3 free} = {[1,2,3],[1,3,2],
+    // [3,1,2]} = exactly 3, hand-counted independent of `depends`.
+    fn interleaved(world: &mut World) {
+        let (tx, rx) = world.channel::<i32>("ch");
+        let tx_a = tx.clone();
+        world.spawn("producer-a", async move {
+            tx_a.send(1).await;
+            tx_a.send(2).await;
+            Ok(())
+        });
+        world.spawn("producer-b", async move {
+            tx.send(3).await;
+            Ok(())
+        });
+        world.spawn("consumer", async move {
+            rx.recv().await;
+            rx.recv().await;
+            rx.recv().await;
+            Ok(())
+        });
+    }
+
+    // Two writers race an atomic `x` while two producers race a channel; the consumer
+    // recvs both messages. The atomic and the channel are different objects, so their
+    // orders are independent: 2 (store order) × 2 (send order) = 4 classes.
+    fn mixed(world: &mut World) {
+        let x = world.atomic("x", 0i32);
+        spawn_store(world, "writer-1", x.clone(), 1);
+        spawn_store(world, "writer-2", x, 2);
+        let (tx, rx) = world.channel::<i32>("ch");
+        let tx2 = tx.clone();
+        world.spawn("producer-1", async move {
+            tx.send(1).await;
+            Ok(())
+        });
+        world.spawn("producer-2", async move {
+            tx2.send(2).await;
+            Ok(())
+        });
+        world.spawn("consumer", async move {
+            rx.recv().await;
+            rx.recv().await;
+            Ok(())
+        });
+    }
+
+    // The consumer's control flow depends on which message it recvs first: a sentinel
+    // makes it load the atomic, otherwise it stores it — racing a writer on that
+    // atomic. The channel analog of `branch_changes_ops`: a reversing fragment from
+    // one branch references an atomic op that vanishes on the other.
+    fn branch_consumer(world: &mut World) {
+        let x = world.atomic("x", 0i32);
+        let writer = x.clone();
+        spawn_store(world, "writer", writer, 5);
+        let (tx, rx) = world.channel::<i32>("ch");
+        let tx2 = tx.clone();
+        world.spawn("producer-1", async move {
+            tx.send(0).await; // sentinel
+            Ok(())
+        });
+        world.spawn("producer-2", async move {
+            tx2.send(1).await;
+            Ok(())
+        });
+        world.spawn("consumer", async move {
+            if rx.recv().await == 0 {
+                x.load().await;
+            } else {
+                x.store(9).await;
+            }
+            Ok(())
+        });
+    }
+
+    // The exact program that panicked under Optimal before the `restamp` fix: a racy
+    // atomic read sits between sends, so a later send's per-object seq drifts with the
+    // g load/store order — the stale-seq case `restamp` repairs. 3! send orders × 2
+    // for the g race.
+    fn seq_drift(world: &mut World) {
+        let g = world.atomic("g", 0i32);
+        let (tx, rx) = world.channel::<i32>("ch");
+        let tx1 = tx.clone();
+        world.spawn("p1", async move {
+            tx1.send(1).await;
+            Ok(())
+        });
+        let gw = g.clone();
+        spawn_store(world, "writer-g", gw, 5);
+        let tx3 = tx.clone();
+        world.spawn("p3", async move {
+            g.load().await;
+            tx3.send(3).await;
+            Ok(())
+        });
+        world.spawn("p2", async move {
+            tx.send(2).await;
+            Ok(())
+        });
+        world.spawn("consumer", async move {
+            rx.recv().await;
+            rx.recv().await;
+            rx.recv().await;
+            Ok(())
+        });
+    }
+
     // --- POPL'14 benchmarks -----------------------------------------------------
     // Direct ports of the paper's `readers` / `lastzero` / `indexer`. Each `.await`
     // is one DPOR step, so these reproduce the paper's *optimal* column (the number
@@ -751,6 +1002,59 @@ mod tests {
     fn detects_deadlock() {
         let failed = explore(&never_finishes, &mut (), Strategy::Optimal).unwrap_err();
         assert_eq!(failed.to_string(), "deadlock");
+    }
+
+    // --- channels ---------------------------------------------------------------
+
+    #[test]
+    fn channel_one_per_class() {
+        // Two producers + one consumer: only the enqueue order matters (2 classes),
+        // and Optimal matches the exhaustive-DFS ground truth exactly.
+        assert_optimal(&producer_consumer);
+    }
+
+    #[test]
+    fn rpc_mux_bug_found_identically() {
+        // Differential soundness: DFS and Optimal both find the reply-misrouting bug
+        // and report the same failing state.
+        let dfs = explore(&rpc_mux, &mut (), Strategy::Dfs).unwrap_err();
+        let opt = explore(&rpc_mux, &mut (), Strategy::Optimal).unwrap_err();
+        assert_eq!(opt.to_string(), dfs.to_string());
+    }
+
+    #[test]
+    fn channel_three_producers() {
+        // 3! enqueue orders ⇒ 6 classes.
+        assert_leaves(&three_producers, 30, 6);
+    }
+
+    #[test]
+    fn channel_interleaved_independent_count() {
+        // Optimal == 3 is hand-derived from program-order + FIFO (the linearizations
+        // of {1<2, 3 free}), independent of the crate's `depends`.
+        assert_leaves(&interleaved, 15, 3);
+    }
+
+    #[test]
+    fn channel_mixed_objects() {
+        // Cross-object independence: 2 store orders × 2 send orders = 4 classes.
+        assert_leaves(&mixed, 120, 4);
+    }
+
+    #[test]
+    fn channel_branch_consumer() {
+        // The recv'd value flips which atomic op the consumer issues; a reversing
+        // fragment references an op that vanishes on the other branch. Just optimal.
+        assert_optimal(&branch_consumer);
+    }
+
+    #[test]
+    fn channel_seq_drift_no_panic() {
+        // Pins the stale-seq fix (`restamp`): without it Optimal panics in the
+        // channel's `kind_of` on a carried edge whose seq drifted. 3! send orders × 2
+        // for the g load/store race.
+        assert_optimal(&seq_drift);
+        assert_leaves(&seq_drift, 608, 12);
     }
 
     // --- POPL'14 benchmark counts -----------------------------------------------

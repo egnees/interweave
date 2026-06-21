@@ -72,6 +72,9 @@ Runnable examples live in [`examples/`](examples):
   mid-transfer.
 - `custom_object` — define your own synchronization primitive by implementing
   `Object` and registering it with `World::register`.
+- `rpc_mux` — an RPC connection multiplexer that routes replies by a shared
+  in-flight slot instead of the id in each frame, so under a race a reply is
+  delivered to the wrong call.
 - `readers` / `lastzero` / `indexer` — reproduce the POPL'14 Optimal-DPOR
   benchmark counts (one maximal trace per Mazurkiewicz class).
 
@@ -83,8 +86,8 @@ Three module layers, dependencies pointing downward (`search → model`, with
 - `model/` — the modeled system and its execution: the deterministic `executor`,
   the `Object` trait + `Transition`, processes, and the `World` / `State` /
   `StateView` the search walks. Transparent to the layer above.
-- `sync/` — synchronization primitives (`Atomic` now; channels later) whose every
-  observable operation is a `.await` yield point.
+- `sync/` — synchronization primitives (`Atomic` and an unbounded MPSC channel:
+  `Sender` / `Receiver`) whose every observable operation is a `.await` yield point.
 - `search/` — the exploration algorithms (naive DFS and Optimal DPOR; `explore`
   takes the `Strategy`) and the `Observer` hook they call at every state.
 

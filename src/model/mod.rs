@@ -15,7 +15,7 @@ pub use process::{ProcessID, ProcessResult};
 
 pub(crate) use executor::{Executor, pid};
 
-use crate::sync::Atomic;
+use crate::sync::{Atomic, ChannelHandle, Receiver, Sender};
 
 /// The program under test: a builder owning its processes and synchronization
 /// objects. A setup closure populates it via [`spawn`](World::spawn) and
@@ -51,6 +51,17 @@ impl<'a> World<'a> {
         value: T,
     ) -> Atomic<T> {
         self.register(name, |id| Atomic::new(id, value))
+    }
+
+    /// Creates a named unbounded MPSC channel, returning a cloneable [`Sender`]
+    /// (multi-producer) and a single [`Receiver`] (not cloneable). Every `send` and
+    /// `recv` is a scheduling point; a `recv` on an empty channel blocks.
+    pub fn channel<T: Debug + 'static>(
+        &mut self,
+        name: impl Into<String>,
+    ) -> (Sender<T>, Receiver<T>) {
+        let driver = self.register(name, ChannelHandle::new);
+        driver.split()
     }
 
     /// Registers a custom synchronization object, returning the cloneable handle
@@ -253,9 +264,18 @@ impl<'a> State<'a> {
             .collect()
     }
 
-    // Transitions on different objects are independent; same-object pairs are the
-    // object's call.
-    pub(crate) fn depends(&self, t1: Transition, t2: Transition) -> bool {
+    /// Whether two transitions *conflict* — fail to commute, so the order in which they
+    /// commit can change the outcome. This is the dependency relation that drives
+    /// partial-order reduction: independent transitions may be reordered freely, while
+    /// dependent ones must be explored in both orders. Use it to reconstruct
+    /// happens-before over a trace (e.g. for a visualization or a custom analysis).
+    ///
+    /// Transitions on different objects are always independent — sound because the model
+    /// is "one transition touches exactly one object", so no single step can couple two;
+    /// same-object pairs defer to the object's own [`Object::depends`]. Evaluate it on a
+    /// state where both transitions occur (e.g. a maximal trace): for some primitives
+    /// (channels) the relation depends on the committed history.
+    pub fn depends(&self, t1: Transition, t2: Transition) -> bool {
         t1.oid == t2.oid && self.world.objects[t1.oid].depends(t1, t2)
     }
 
