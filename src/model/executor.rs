@@ -167,7 +167,7 @@ pub(crate) fn pid() -> ProcessID {
 
 /// A process error carrying only the raw [`ProcessID`], as known to the executor.
 ///
-/// `World::named_error` promotes this into the public, name-bearing
+/// `World::run` promotes this into the public, name-bearing
 /// [`ProcessError`](super::ProcessError).
 #[derive(Debug)]
 pub(crate) struct RawProcessError {
