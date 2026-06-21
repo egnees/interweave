@@ -1,11 +1,8 @@
-//! The modeled concurrent system and its execution.
-//!
-//! A [`World`] is the builder that owns the processes and synchronization objects
-//! of a program under test. A [`State`] is a node in the search tree: a `World`
-//! advanced along a [`Transition`] trace, reporting its enabled transitions and,
-//! at a leaf, why it stopped ([`FailureReason`]). The search layer reaches the
-//! model only through this public surface; states are reconstructed by *replaying*
-//! a trace, since process futures cannot be cloned.
+//! The modeled concurrent system and its execution: a [`World`] builds the
+//! processes and synchronization objects of a program under test, and a [`State`]
+//! is that world advanced along a [`Transition`] trace. The search layer reaches
+//! the model only through this surface and rebuilds states by *replaying* a trace,
+//! since process futures cannot be cloned.
 
 mod executor;
 mod object;
@@ -20,15 +17,11 @@ pub(crate) use executor::{Executor, pid};
 pub(crate) use object::{Object, ObjectID};
 
 use crate::sync::Atomic;
-use executor::RawProcessError;
 
-/// The program under test: the builder that owns its processes and
-/// synchronization objects.
-///
-/// A setup closure populates a `World` by [`spawn`](World::spawn)ing process
-/// futures and creating shared objects with [`atomic`](World::atomic). The same
-/// closure is re-run on every replay, so it must build the same processes and
-/// objects in the same order — object and transition ids are assigned in insertion
+/// The program under test: a builder owning its processes and synchronization
+/// objects. A setup closure populates it via [`spawn`](World::spawn) and
+/// [`atomic`](World::atomic); the same closure is re-run on every replay, so it
+/// must build the same objects in the same order — ids are assigned by insertion
 /// order, and that fixed order is what makes replay deterministic.
 #[derive(Default)]
 pub struct World<'a> {
@@ -39,9 +32,8 @@ pub struct World<'a> {
 }
 
 impl<'a> World<'a> {
-    /// Registers a named process from a future. Every `.await` inside `code` on a
-    /// synchronization primitive is a scheduling point the model checker can pivot
-    /// on. The name appears in traces and reports.
+    /// Registers a named process. Every `.await` on a synchronization primitive
+    /// inside `code` is a scheduling point. The name appears in traces and reports.
     pub fn spawn(
         &mut self,
         name: impl Into<String>,
@@ -52,9 +44,8 @@ impl<'a> World<'a> {
         self.process_names.push(name.into());
     }
 
-    /// Creates a named shared [`Atomic`] cell with an initial value, returning a
-    /// cloneable handle whose `load` / `store` / `compare_exchange` operations are
-    /// scheduling points. Clone the handle into the processes that share the cell.
+    /// Creates a named shared [`Atomic`] cell, returning a cloneable handle whose
+    /// `load` / `store` / `compare_exchange` operations are scheduling points.
     pub fn atomic<T: Copy + PartialEq + Debug + 'static>(
         &mut self,
         name: impl Into<String>,
@@ -77,8 +68,7 @@ impl<'a> World<'a> {
         &self.object_names[t.oid]
     }
 
-    /// A human-readable label for a *committed* [`Transition`] (e.g.
-    /// `"load -> 123"`). Only meaningful after the transition has been applied.
+    /// A human-readable label for a *committed* [`Transition`] (e.g. `"load -> 123"`).
     pub fn label(&self, t: &Transition) -> String {
         self.objects[t.oid].label(t)
     }
@@ -93,26 +83,19 @@ impl<'a> World<'a> {
         &self.object_names
     }
 
-    // Promotes a raw executor failure (which only knows the pid) into the
-    // public, name-bearing error. The pid indexes the name table.
-    fn named_error(&self, raw: RawProcessError) -> ProcessError {
-        ProcessError {
-            process: self.process_names[raw.pid].clone(),
-            source: raw.source,
-        }
-    }
-
-    // Drives the executor and reports a process error as a settled failure.
+    // Drives the executor, promoting a raw failure (pid only) into the public,
+    // name-bearing FailureReason.
     fn run(&mut self) -> Option<FailureReason> {
-        self.exec
-            .execute()
-            .err()
-            .map(|raw| FailureReason::Process(self.named_error(raw)))
+        self.exec.execute().err().map(|raw| {
+            FailureReason::Process(ProcessError {
+                process: self.process_names[raw.pid].clone(),
+                source: raw.source,
+            })
+        })
     }
 }
 
-/// The error reported when a process future returns `Err`, naming the offending
-/// process.
+/// The error reported when a process future returns `Err`, naming the process.
 #[derive(Debug, thiserror::Error)]
 #[error("process {process} failed: {source}")]
 pub struct ProcessError {
@@ -127,10 +110,9 @@ impl ProcessError {
     }
 }
 
-/// Why a settled [`State`] can make no further useful progress.
-///
-/// A `State` reports this about itself via [`State::failure_reason`], so the search
-/// layer sees failed states through the same interface as healthy ones.
+/// Why a settled [`State`] makes no further progress. A `State` reports this via
+/// [`failure_reason`](State::failure_reason), so the search layer sees failed and
+/// healthy states through one interface.
 #[derive(Debug, thiserror::Error)]
 pub enum FailureReason {
     /// A process future returned an error.
@@ -144,11 +126,9 @@ pub enum FailureReason {
 /// A node in the search tree: a [`World`] advanced along a [`Transition`] trace.
 ///
 /// Construction runs the setup closure and the executor to the first scheduling
-/// point; the search layer steps it forward one transition at a time. A state
-/// exposes its enabled transitions and, once settled, its
-/// [`failure_reason`](State::failure_reason). States cannot be cloned directly
-/// (process futures cannot be cloned) — the search layer rebuilds them by replaying
-/// a trace.
+/// point; the search layer steps it forward one transition at a time. States
+/// cannot be cloned (process futures cannot) — the search layer rebuilds them by
+/// replaying a trace.
 pub struct State<'a> {
     world: World<'a>,
     setup: &'a dyn Fn(&mut World<'a>),
@@ -174,9 +154,8 @@ impl<'a> StateView<'a> {
         &self.trace
     }
 
-    // Replays this view's setup against a fresh trace prefix. Lets the Optimal
-    // driver rebuild the live state at any surviving prefix from the root in one
-    // replay, keeping `setup` private (the view is the only setup carrier).
+    // Rebuilds the live state at an arbitrary prefix in one replay from the root,
+    // keeping `setup` private to the view.
     pub(crate) fn replay(&self, trace: Vec<Transition>) -> State<'a> {
         Self {
             setup: self.setup,
@@ -185,9 +164,8 @@ impl<'a> StateView<'a> {
         .state()
     }
 
-    // Rebuilds the full state by replaying the recorded schedule. A view is a
-    // valid prefix by construction, so only its final state may carry a failure;
-    // an earlier one means the model is non-deterministic.
+    // Rebuilds the full state by replaying the recorded schedule. A view is a valid
+    // prefix by construction, so only its final state may carry a failure.
     pub(crate) fn state(&self) -> State<'a> {
         let mut state = State::new(self.setup);
         for &t in &self.trace {
@@ -217,8 +195,8 @@ impl<'a> State<'a> {
         state
     }
 
-    /// The underlying [`World`], for resolving process/object names and labels of
-    /// the transitions in this state's trace.
+    /// The underlying [`World`], for resolving names and labels of this state's
+    /// transitions.
     pub fn world(&self) -> &World<'a> {
         &self.world
     }
@@ -228,20 +206,15 @@ impl<'a> State<'a> {
         &self.trace
     }
 
-    /// The reason this state ends its branch, or `None` if it is still runnable or
+    /// Why this state ends its branch, or `None` if it is still runnable or
     /// completed cleanly.
-    ///
-    /// The strategy reads it to stop exploring a branch; an observer reads it to
-    /// distinguish a failing leaf from a clean one.
     pub fn failure_reason(&self) -> Option<&FailureReason> {
         self.failure.as_ref()
     }
 
-    /// Whether this state is a leaf of the search tree: a failure, or a clean
-    /// completion with no process left to advance.
-    ///
-    /// Each leaf corresponds to one maximal interleaving, so an [`Observer`] can
-    /// count maximal traces by counting the states for which this is `true`.
+    /// Whether this state is a leaf: a failure, or a clean completion with nothing
+    /// left to advance. Each leaf is one maximal interleaving, so an [`Observer`]
+    /// can count maximal traces by counting terminal states.
     ///
     /// [`Observer`]: crate::Observer
     pub fn is_terminal(&self) -> bool {
@@ -269,25 +242,21 @@ impl<'a> State<'a> {
     // Transitions on different objects are independent; same-object pairs are the
     // object's call.
     pub(crate) fn depends(&self, t1: Transition, t2: Transition) -> bool {
-        if t1.oid != t2.oid {
-            return false;
-        }
-        self.world.objects[t1.oid].depends(t1, t2)
+        t1.oid == t2.oid && self.world.objects[t1.oid].depends(t1, t2)
     }
 
     pub(crate) fn apply(&mut self, t: Transition) {
         debug_assert!(self.failure.is_none(), "apply on an already-failed state");
-        // Record before executing so a failing transition is part of the trace:
-        // the view of a failed state must replay the failure (see FailedState).
+        // Record before executing so a failing transition is part of the trace
+        // (its view must replay the failure — see FailedState).
         self.trace.push(t);
         self.world.objects[t.oid].apply(t);
         self.failure = self.world.run();
         self.settle();
     }
 
-    // After the executor has run: if no process erred yet nothing is enabled and
-    // a process is still live, the state is deadlocked. A process error (already
-    // set) takes precedence.
+    // No process erred but nothing is enabled while a process is still live:
+    // deadlock. An already-set process error takes precedence.
     fn settle(&mut self) {
         if self.failure.is_none() && self.enabled().is_empty() && self.pending() > 0 {
             self.failure = Some(FailureReason::Deadlock);
@@ -307,8 +276,7 @@ impl<'a> State<'a> {
         self.view().state()
     }
 
-    // Consumes a failed state into its reason and a replayable view. Panics if
-    // the state has not failed.
+    // Consumes a failed state into its reason and a replayable view; panics if healthy.
     pub(crate) fn into_failure(self) -> (FailureReason, StateView<'a>) {
         let reason = self.failure.expect("into_failure on a healthy state");
         let view = StateView {
