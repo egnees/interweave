@@ -1,7 +1,8 @@
 /target
 
-# Local Claude Code configuration (agents, skills, settings).
+# Local Claude Code configuration (agents, skills, settings) and guidance.
 /.claude/
+/CLAUDE.md
 
 # macOS Finder metadata.
 .DS_Store
