@@ -1,14 +1,11 @@
-//! The Optimal-DPOR driver — a replay-once exploration of one interleaving per equivalence class.
+//! Optimal DPOR (Abdulla et al., POPL'14) as a replay-once driver: explores one
+//! interleaving per Mazurkiewicz (happens-before) class with no sleep-set blocking.
 //!
-//! Implements Optimal Dynamic Partial Order Reduction (Abdulla et al., POPL'14) as a driver
-//! around the executor: a per-prefix *wakeup tree* of reversing fragments plus a *sleep set*,
-//! with vector-clock happens-before and race analysis performed only on maximal (complete)
-//! traces.
-//!
-//! It is *replay-once*: a single live `State` is stepped forward in place during descent (no
-//! per-node fork), ancestors are kept only as lightweight metadata frames, and backtracking
-//! rebuilds the live state with one root replay of the surviving transition prefix rather than
-//! reconstructing every node. The driver speaks only in `Transition`s and pids.
+//! A per-prefix *wakeup tree* of reversing fragments plus a *sleep set* replace
+//! classical DPOR's persistent set; races are analysed only on maximal traces via
+//! vector-clock happens-before. One live `State` (`cur`) is stepped forward in
+//! place during descent — ancestors survive only as metadata `Frame`s — and
+//! backtracking rebuilds `cur` with a single root replay of the surviving prefix.
 
 use std::collections::BTreeSet;
 
@@ -16,41 +13,22 @@ use super::explore::FailedState;
 use super::observer::Observer;
 use crate::model::{State, Transition};
 
-// Optimal DPOR (Abdulla, Aronis, Jonsson, Sagonas, POPL'14): explores exactly one
-// interleaving per Mazurkiewicz (happens-before) equivalence class and never hits
-// a sleep-set-blocked state. It replaces classical DPOR's per-state persistent set
-// with a per-prefix *wakeup tree* (the reversing fragments still to explore) plus a
-// *sleep set*; races are analysed only on maximal (complete) traces, where the
-// reversing fragment v = notdep(e,E).proc(e') is fully known.
-//
-// The wakeup tree is one global ordered tree (≺ = sibling order). A frame's node is
-// reached by following its trace from the root, taking the ≺-minimal child at each
-// step. Branches are matched by *pid* — a transition's per-object `seq` is not
-// stable across interleavings — but each edge also carries its `Transition` so that
-// `insert` / `check_initial` evaluate `depends` against the final maximal trace
-// without replaying: on a completed trace `depends` is a pure function of the two
-// transitions' op kinds, identical in any state where both are resolvable.
-//
-// Driver shape: ONE live `State` (`cur`) at the current deepest prefix, stepped
-// forward in place during descent. Ancestors are kept only as metadata `Frame`s
-// (their sleep set, the pending/enabled at that prefix). Backtracking cannot
-// un-apply a future, so on each pop-to-a-live-branch the state is rebuilt with a
-// single root replay of the surviving transition prefix.
-
-// One node of the wakeup tree: children in ≺ order (Vec order). Each edge carries
-// the planned transition (for dependency tests) but is matched by `transition.pid`;
-// the front child is the ≺-minimal one (explored first), and `insert` appends new
-// branches at the back.
+// One wakeup-tree node: children in ≺ (sibling) order, `children[0]` the ≺-minimal
+// (explored first); `graft`/`insert` append new branches at the back. Each edge
+// carries its planned transition for dependency tests but is matched by `pid` (the
+// per-object `seq` is not stable across interleavings). On a completed trace
+// `depends` is a pure function of the two ops' kinds, so the carried transitions
+// resolve identically in any state where both occur — that is what lets `insert` /
+// `check_initial` run against the final maximal trace without replaying.
 #[derive(Default)]
 struct Wut {
     children: Vec<(Transition, Wut)>,
 }
 
 impl Wut {
-    // Appends `seq` as a fresh linear branch, ordered after the existing children.
-    // Navigation matches by first pid, so siblings must have distinct pids —
-    // `insert` upholds this (it descends into an existing child whenever `seq`'s
-    // head pid matches one, reaching `graft` only for a new pid).
+    // Appends `seq` as a fresh branch after the existing children. Navigation
+    // matches by head pid, so siblings must have distinct pids — `insert` only
+    // reaches `graft` for a new pid.
     fn graft(&mut self, seq: &[Transition]) {
         let Some((&head, rest)) = seq.split_first() else {
             return;
@@ -65,17 +43,14 @@ impl Wut {
     }
 }
 
-// A DFS stack frame: metadata for the prefix E it describes, captured while E's
-// state was still live so the search can reason about E after stepping past it.
-// `sleep` is sleep(E) (mutable: filtered into children at descent, grown on
-// backtrack); `pending` is each enabled process's next op and `enabled` their
-// pids, used by the weak-initial guard against a maximal trace. No live `State` is kept
-// per frame — only the single `cur` is. `frames[m]` describes prefix `trace[..m]`,
-// so `frames.len() == prefix.len() + 1` (the root frame is always present).
+// DFS-stack metadata for the prefix E it describes, captured while E was live so
+// the search can reason about E after stepping past it. `sleep` is sleep(E)
+// (filtered into children on descent, grown on backtrack); `pending` is each
+// enabled process's next op. `frames[m]` describes `trace[..m]`, so
+// `frames.len() == prefix.len() + 1` (the root frame is always present).
 struct Frame {
     sleep: Vec<usize>,
     pending: Vec<Transition>,
-    enabled: Vec<usize>,
 }
 
 pub(super) fn run<'a>(
@@ -97,26 +72,22 @@ pub(super) fn run<'a>(
         tree.graft(&[resolve(&root, p).expect("a seeded process must be runnable")]);
     }
 
-    // The root frame (prefix length 0). `frames[m]` describes `trace[..m]`.
     let mut frames: Vec<Frame> = vec![Frame {
         sleep: Vec::new(),
         pending: root.enabled(),
-        enabled: enabled_pids(&root).into_iter().collect(),
     }];
     let mut cur = root;
-    // The transition prefix of `cur`: push on apply, truncate on pop. Feeds the
-    // single root replay on backtrack. `prefix.len() == frames.len() - 1`.
+    // `cur`'s transition prefix: push on apply, pop on backtrack. Its length is the
+    // depth of `cur`'s node (a path of ≺-minimal children), and it feeds the single
+    // root replay on backtrack. `prefix.len() == frames.len() - 1`.
     let mut prefix: Vec<Transition> = Vec::new();
-    // Child-index path from the root to `cur`'s node (always the ≺-min child, so
-    // all zeros today, but kept general); lockstep with `prefix`.
-    let mut cursor: Vec<usize> = Vec::new();
     let mut need_replay = false;
 
     loop {
-        // An empty wut node means this frame is fully explored. Popping it past the
-        // root means the whole search is done.
-        if node_at(&tree, &cursor).children.is_empty() {
-            if pop_exhausted(&mut tree, &mut frames, &mut prefix, &mut cursor) {
+        // An empty node means this frame is fully explored; popping past the root
+        // ends the search.
+        if node_at(&tree, prefix.len()).children.is_empty() {
+            if pop_exhausted(&mut tree, &mut frames, &mut prefix) {
                 return Ok(());
             }
             need_replay = true;
@@ -128,19 +99,17 @@ pub(super) fn run<'a>(
             need_replay = false;
         }
 
-        // Explore the ≺-minimal (front) child. The edge carries the planned
-        // transition, but it is re-resolved against the live `cur` so replay (not
-        // the stored seq) drives which concrete op runs.
-        let p = node_at(&tree, &cursor).children[0].0.pid;
+        // Explore the ≺-minimal child, re-resolving its op against the live `cur`
+        // so replay (not the stored seq) drives which concrete op runs.
+        let p = node_at(&tree, prefix.len()).children[0].0.pid;
         let p_t = resolve(&cur, p).expect("a wakeup-tree branch must be runnable");
         debug_assert!(
             cur.enabled().contains(&p_t),
             "a committed op must be enabled"
         );
 
-        // Sleep' for the child, computed on the LIVE `cur` BEFORE the in-place apply
-        // below — the single ordering hazard of replay-once: the parent must be
-        // snapshot before stepping past it.
+        // Sleep' for the child, computed on the LIVE parent BEFORE the in-place
+        // apply below — the one ordering hazard of replay-once.
         let child_sleep = child_sleep_set(&cur, frames.last().unwrap(), p_t);
 
         cur.apply(p_t);
@@ -150,48 +119,37 @@ pub(super) fn run<'a>(
             let (reason, view) = cur.into_failure();
             return Err(FailedState::new(reason, view));
         }
-        // The child frame describes the new prefix: `sleep` was computed pre-apply
-        // (the hazard), but `pending` / `enabled` are the new prefix's own and so
-        // are read from the live `cur` after the apply that produced it.
         frames.push(Frame {
             sleep: child_sleep,
             pending: cur.enabled(),
-            enabled: enabled_pids(&cur).into_iter().collect(),
         });
         prefix.push(p_t);
-        cursor.push(0);
 
         if cur.enabled().is_empty() {
             // A maximal trace: plan every reversible race's reversal into the
-            // wakeup trees of the ancestor prefixes.
+            // ancestor wakeup trees.
             plan_reversals(&mut tree, &frames, &prefix, &cur);
             debug_assert!(
-                node_at(&tree, &cursor).children.is_empty(),
+                node_at(&tree, prefix.len()).children.is_empty(),
                 "a maximal trace's wakeup-tree node has no continuations"
             );
             need_replay = true;
         } else {
-            seed_child(&mut tree, &cursor, &cur, &frames.last().unwrap().sleep);
+            seed_child(&mut tree, prefix.len(), &cur, &frames.last().unwrap().sleep);
         }
     }
 }
 
-// Pops the exhausted top frame: drops the finished (≺-minimal) branch in the parent
-// and sleeps its head (Algorithm 2 line 17). Returns `true` when the popped frame
-// was the root, i.e. the whole search is done.
-fn pop_exhausted(
-    tree: &mut Wut,
-    frames: &mut Vec<Frame>,
-    prefix: &mut Vec<Transition>,
-    cursor: &mut Vec<usize>,
-) -> bool {
+// Pops the exhausted top frame: drops the finished (≺-minimal) branch from the
+// parent and sleeps its head (Algorithm 2 line 17). Returns `true` when the popped
+// frame was the root, i.e. the whole search is done.
+fn pop_exhausted(tree: &mut Wut, frames: &mut Vec<Frame>, prefix: &mut Vec<Transition>) -> bool {
     frames.pop();
     let Some(finished_t) = prefix.pop() else {
         return true;
     };
     let finished = finished_t.pid;
-    cursor.pop();
-    let parent = node_at_mut(tree, cursor);
+    let parent = node_at_mut(tree, prefix.len());
     debug_assert_eq!(
         parent.children.first().map(|(t, _)| t.pid),
         Some(finished),
@@ -202,8 +160,9 @@ fn pop_exhausted(
     false
 }
 
-// Sleep' = { q ∈ sleep(E) | next(q) independent of p's step }. The parent's sleep is
-// read live (line-17 pops may have grown it) and each q is resolved against `cur`.
+// Sleep' = { q ∈ sleep(E) | next(q) independent of p's step }. The parent's sleep
+// is read live (line-17 pops may have grown it) and each q is resolved against
+// `cur`.
 fn child_sleep_set(cur: &State, parent: &Frame, p_t: Transition) -> Vec<usize> {
     parent
         .sleep
@@ -216,10 +175,10 @@ fn child_sleep_set(cur: &State, parent: &Frame, p_t: Transition) -> Vec<usize> {
         .collect()
 }
 
-// Seeds the child's wut with one enabled non-sleeping process — but only if a race
-// did not already plant a fragment there.
-fn seed_child(tree: &mut Wut, cursor: &[usize], cur: &State, child_sleep: &[usize]) {
-    if !node_at(tree, cursor).children.is_empty() {
+// Seeds the child node with one enabled non-sleeping process, unless a race
+// already planted a fragment there.
+fn seed_child(tree: &mut Wut, depth: usize, cur: &State, child_sleep: &[usize]) {
+    if !node_at(tree, depth).children.is_empty() {
         return;
     }
     let Some(q) = seed(cur, child_sleep) else {
@@ -230,16 +189,14 @@ fn seed_child(tree: &mut Wut, cursor: &[usize], cur: &State, child_sleep: &[usiz
         "sleep-set-blocked state under Optimal DPOR"
     );
     let q_t = resolve(cur, q).expect("a seeded process must be runnable");
-    node_at_mut(tree, cursor).graft(&[q_t]);
+    node_at_mut(tree, depth).graft(&[q_t]);
 }
 
 // Plans the reversal of every reversible race in the maximal trace `state`: for a
 // race (e, e') it inserts v = notdep(e, E).proc(e') into the wakeup tree of the
-// prefix just before e, unless a sleeping process already covers it.
-//
-// `trace` is the maximal transition sequence; `frames[m]` describes the prefix
-// `trace[..m]` (root-inclusive: `frames[0]` is the root). So E' = pre(E, e) for
-// event i (1-based) is `frames[i-1]`, and its wut node sits at cursor depth i-1.
+// prefix just before e, unless a process already asleep there covers it.
+// `frames[m]` describes `trace[..m]`, so E' = pre(E, e) for event i (1-based) is
+// `frames[i-1]` and its wut node sits at depth i-1.
 fn plan_reversals(tree: &mut Wut, frames: &[Frame], trace: &[Transition], state: &State) {
     let n = trace.len();
     let clocks = event_clocks(state, trace);
@@ -249,35 +206,34 @@ fn plan_reversals(tree: &mut Wut, frames: &[Frame], trace: &[Transition], state:
             if !reversible_race(state, &clocks, trace, i, j) {
                 continue;
             }
-            // The reversing fragment v = notdep(e, E).proc(e') and the prefix E' =
-            // pre(E, e) it belongs to (frames[i-1]).
             let mut v = notdep(&clocks, trace, i);
             v.push(trace[j - 1]);
-            let pre = &frames[i - 1];
-            if covered_by_sleeper(state, pre, &v) {
+            if covered_by_sleeper(state, &frames[i - 1], &v) {
                 continue;
             }
-            // The wut node for prefix trace[..i-1] is at cursor depth i-1 (≺-min
-            // descent), so a path of (i-1) zeros.
-            insert(node_at_mut(tree, &vec![0; i - 1]), state, &v);
+            insert(node_at_mut(tree, i - 1), state, &v);
         }
     }
 }
 
-// Guard sleep(E') ∩ WI[E'](v) ≠ ∅ (Algorithm 2 line 6): whether a process already
-// asleep at the prefix `pre` is a weak-initial of `v`, in which case the reversal is
-// already covered and must not be re-inserted.
+// Algorithm 2 line 6: whether a process already asleep at prefix `pre` is a
+// weak-initial of `v`, in which case the reversal is already covered. `pending` is
+// the enabled set today (atomics never block); once channels land, a blocked recv
+// is pending-but-not-enabled and must be excluded here.
 fn covered_by_sleeper(state: &State, pre: &Frame, v: &[Transition]) -> bool {
     pre.sleep.iter().any(|&q| {
-        let q_t = pre.pending.iter().copied().find(|t| t.pid == q);
-        weak_initial(state, q_t, &pre.enabled, v)
+        pre.pending
+            .iter()
+            .copied()
+            .find(|t| t.pid == q)
+            .is_some_and(|q_t| check_initial(state, q_t, v).is_some())
     })
 }
 
-// insert[E'](v, wut): descends the branch that is the longest weak-initial prefix
-// of v (stripping each matched process), then grafts the residual as a new branch.
-// Dependency tests run against the final maximal `state` (the carried transitions
-// resolve identically there), so no replay/fork is needed while descending.
+// insert[E'](v): descends the branch that is the longest weak-initial prefix of v
+// (stripping each matched process), then grafts the residual as a new branch.
+// Dependency tests run against the maximal `state` (the carried transitions resolve
+// identically there), so no replay is needed while descending.
 fn insert(node: &mut Wut, state: &State, v: &[Transition]) {
     for idx in 0..node.children.len() {
         let q_t = node.children[idx].0;
@@ -285,7 +241,7 @@ fn insert(node: &mut Wut, state: &State, v: &[Transition]) {
             continue; // q is not a weak-initial of v: try the next sibling.
         };
         if node.children[idx].1.children.is_empty() {
-            return; // an existing leaf covers v.
+            return; // an existing leaf already covers v.
         }
         insert(&mut node.children[idx].1, state, &rest);
         return;
@@ -293,15 +249,12 @@ fn insert(node: &mut Wut, state: &State, v: &[Transition]) {
     node.graft(v);
 }
 
-// Whether `q_t` (process q's next op at this prefix) is a weak-initial of `v`, and
-// if so the residual (v with q's first occurrence removed). Walks v from the front:
-// if a v-event that q's op depends on comes first, q is blocked; if q's own
-// occurrence comes first (or q is independent of all of v), it is a weak-initial.
-//
-// No replay: q's next op never changes while stripping events independent of it
-// (that is the weak-initial definition), so the op carried in `q_t` is the same op
-// the old fork-and-re-resolve would have found. `depends` is evaluated against the
-// final maximal `state`, where every v-event and q_t are resolvable to the same op.
+// Whether `q_t` (q's next op) is a weak-initial of `v`, and if so the residual (v
+// with q's first occurrence removed). Walking v from the front: q is blocked if a
+// v-event it depends on comes first; otherwise q's own occurrence (or independence
+// from all of v) makes it a weak-initial. q's op is stable while stripping events
+// independent of it, and `depends` is evaluated on the maximal `state` where every
+// event resolves — so no replay is needed.
 fn check_initial(state: &State, q_t: Transition, v: &[Transition]) -> Option<Vec<Transition>> {
     for (k, &vk) in v.iter().enumerate() {
         if vk.pid == q_t.pid {
@@ -316,28 +269,8 @@ fn check_initial(state: &State, q_t: Transition, v: &[Transition]) -> Option<Vec
     Some(v.to_vec())
 }
 
-// Whether process `q` (its next op `q_t`, or `None` if q already finished / has no
-// pending op) is a weak-initial of `v` from the prefix with the given enabled pids.
-// A finished process leads nothing. WI also requires q to be currently enabled (its
-// op could actually run first); atomics never block, but the guard is explicit.
-fn weak_initial(
-    state: &State,
-    q_t: Option<Transition>,
-    enabled: &[usize],
-    v: &[Transition],
-) -> bool {
-    let Some(q_t) = q_t else {
-        return false;
-    };
-    if !enabled.contains(&q_t.pid) {
-        return false;
-    }
-    check_initial(state, q_t, v).is_some()
-}
-
 // notdep(e, E): the events after e (index i, 1-based) that do not happen-after e,
-// as transitions. Event k is in notdep iff e's index is not in k's vector clock,
-// i.e. clocks[k][proc(e)] < i.
+// i.e. e's index is not in their vector clock (clocks[k][proc(e)] < i).
 fn notdep(clocks: &[Vec<usize>], trace: &[Transition], i: usize) -> Vec<Transition> {
     let e = trace[i - 1];
     (i + 1..=trace.len())
@@ -369,11 +302,11 @@ fn happens_before(clocks: &[Vec<usize>], trace: &[Transition], i: usize, j: usiz
     i <= clocks[j][trace[i - 1].pid]
 }
 
-// Per-event vector clocks for a trace. clocks[k] (k in 1..=n) is the clock of the
-// k-th event; clocks[0] is ⊥. Each event's clock starts from its process's previous
-// clock (program order) and merges every dependent predecessor, then sets its own
-// component to k. The program-order seed is what keeps two same-process ops ordered
-// even when the dependency relation calls them independent (two loads).
+// Per-event vector clocks. clocks[k] (k in 1..=n) is the k-th event's clock;
+// clocks[0] is ⊥. Each clock starts from its process's previous clock (program
+// order) and merges every dependent predecessor, then sets its own component to k.
+// The program-order seed keeps two same-process ops ordered even when the
+// dependency relation calls them independent (e.g. two loads).
 fn event_clocks(state: &State, trace: &[Transition]) -> Vec<Vec<usize>> {
     let procs = state.world().processes().len();
     let n = trace.len();
@@ -397,10 +330,9 @@ fn event_clocks(state: &State, trace: &[Transition]) -> Vec<Vec<usize>> {
     clocks
 }
 
-// One enabled process not in `sleep` (least pid, for determinism). Returns `None`
-// only when no process is enabled (a maximal state). If every enabled process is
-// asleep — a sleep-set-blocked state Optimal DPOR must never reach — this asserts
-// in debug and, for soundness in release, falls back to the least enabled process.
+// One enabled process not in `sleep` (least pid, for determinism), or `None` at a
+// maximal state. Optimal DPOR never sleep-set-blocks; the debug_assert guards that,
+// and release falls back to the least enabled process for soundness.
 fn seed(state: &State, sleep: &[usize]) -> Option<usize> {
     let enabled = enabled_pids(state);
     if enabled.is_empty() {
@@ -426,21 +358,20 @@ fn resolve(state: &State, p: usize) -> Option<Transition> {
     state.enabled().into_iter().find(|t| t.pid == p)
 }
 
-// The wakeup-tree node reached by a child-index path. Each step indexes into
-// `children` directly (no pid `find`), so navigation is O(path) of plain indexing;
-// the path is the ≺-min descent (all zeros) and is only walked at branch points.
-fn node_at<'w>(root: &'w Wut, path: &[usize]) -> &'w Wut {
+// The node `depth` ≺-minimal children below `root` (the all-front-child descent the
+// driver always follows; `depth == prefix.len()`).
+fn node_at(root: &Wut, depth: usize) -> &Wut {
     let mut n = root;
-    for &i in path {
-        n = &n.children[i].1;
+    for _ in 0..depth {
+        n = &n.children[0].1;
     }
     n
 }
 
-fn node_at_mut<'w>(root: &'w mut Wut, path: &[usize]) -> &'w mut Wut {
+fn node_at_mut(root: &mut Wut, depth: usize) -> &mut Wut {
     let mut n = root;
-    for &i in path {
-        n = &mut n.children[i].1;
+    for _ in 0..depth {
+        n = &mut n.children[0].1;
     }
     n
 }
@@ -456,9 +387,8 @@ mod tests {
     use crate::search::{Observer, Strategy, explore};
 
     // --- spawn helpers ----------------------------------------------------------
-    // Every fixture is a fixed set of processes, each a short sequence of atomic ops
-    // ending in `Ok(())`. These wrap the spawn-a-future-of-one-op boilerplate so a
-    // fixture reads as the program it models, not as async plumbing.
+    // Each fixture is a fixed set of processes, each a short sequence of atomic ops
+    // ending in `Ok(())`. These wrap the spawn-a-future-of-one-op boilerplate.
 
     fn spawn_store<'a, T>(world: &mut World<'a>, name: impl Into<String>, cell: Atomic<T>, value: T)
     where
@@ -480,8 +410,7 @@ mod tests {
         });
     }
 
-    // A writer that publishes `load(src) + 1` into `dst` — the lastzero(N) writer
-    // shape (each writer chains its source cell to its target cell).
+    // A writer publishing `load(src) + 1` into `dst` — the lastzero(N) writer shape.
     fn spawn_increment<'a>(
         world: &mut World<'a>,
         name: impl Into<String>,
@@ -495,9 +424,8 @@ mod tests {
         });
     }
 
-    // `count` distinct atomics named `<prefix>0..<prefix>(count-1)`, all
-    // zero-initialized. Distinct objects (distinct oids) are what make two cells
-    // independent.
+    // `count` distinct zero-initialized atomics `<prefix>0..<prefix>(count-1)`.
+    // Distinct objects (distinct oids) are what make two cells independent.
     fn cells<'a>(world: &mut World<'a>, prefix: &str, count: usize) -> Vec<Atomic<i32>> {
         (0..count)
             .map(|i| world.atomic(format!("{prefix}{i}"), 0i32))
@@ -506,19 +434,13 @@ mod tests {
 
     // --- observers / metrics ----------------------------------------------------
 
-    // A leaf is a terminal or failed state — one maximal interleaving.
-    fn is_leaf(state: &State) -> bool {
-        state.failure_reason().is_some() || state.enabled().is_empty()
-    }
-
-    // Counts the leaves a search reaches — i.e. the number of maximal interleavings
-    // explored.
+    // Counts the leaves (maximal interleavings) a search reaches.
     #[derive(Default)]
     struct Leaves(usize);
 
     impl Observer for Leaves {
         fn observe(&mut self, state: &State) {
-            if is_leaf(state) {
+            if state.is_terminal() {
                 self.0 += 1;
             }
         }
@@ -530,23 +452,17 @@ mod tests {
         obs.0
     }
 
-    // The ground-truth number of Mazurkiewicz classes: run exhaustive DFS and
-    // canonicalize each maximal trace by its happens-before relation over stable
-    // event labels (pid, per-process index, object). Equivalent interleavings share
-    // one canonical form, so the count of distinct forms is the class count — the
+    // Ground-truth class count: run exhaustive DFS and canonicalize each maximal
+    // trace by its happens-before relation over stable event labels. Equivalent
+    // interleavings share one canonical form, so the number of distinct forms is the
     // exact number Optimal DPOR must explore.
-
-    // A canonical happens-before form: ordered pairs of stable event labels, where a
-    // label is (pid, the process's own op index, object).
-    type Label = (usize, usize, usize);
+    type Label = (usize, usize, usize); // (pid, the process's own op index, oid)
     type Canon = BTreeSet<(Label, Label)>;
 
-    // The canonical happens-before form of one maximal trace.
     fn canon(state: &State) -> Canon {
         let trace = state.trace();
         let n = trace.len();
         let clocks = event_clocks(state, trace);
-        // Stable label per event: (pid, index among the process's own ops, oid).
         let mut seen = BTreeMap::<usize, usize>::new();
         let mut label = vec![(0usize, 0usize, 0usize); n + 1];
         for k in 1..=n {
@@ -571,7 +487,7 @@ mod tests {
 
     impl Observer for Classes {
         fn observe(&mut self, state: &State) {
-            if is_leaf(state) {
+            if state.is_terminal() {
                 self.0.insert(canon(state));
             }
         }
@@ -583,21 +499,21 @@ mod tests {
         obs.0.len()
     }
 
-    // Optimal explores exactly one trace per Mazurkiewicz class, and no more than
-    // exhaustive DFS — the headline optimality property, checked against ground truth.
+    // Optimal explores exactly one trace per class, and never more than DFS.
     fn assert_optimal<'a>(setup: &'a dyn Fn(&mut World<'a>)) {
         let opt = leaves(setup, Strategy::Optimal);
-        let dfs = leaves(setup, Strategy::Dfs);
         assert_eq!(
             opt,
             classes(setup),
             "Optimal must explore one trace per class"
         );
-        assert!(opt <= dfs, "Optimal must never explore more than DFS");
+        assert!(
+            opt <= leaves(setup, Strategy::Dfs),
+            "Optimal must never explore more than DFS"
+        );
     }
 
-    // The common shape: DFS sees `dfs` leaves, Optimal sees `optimal`, and Optimal
-    // is one-per-class against ground truth.
+    // DFS sees `dfs` leaves, Optimal sees `optimal`, and Optimal is one-per-class.
     fn assert_leaves<'a>(setup: &'a dyn Fn(&mut World<'a>), dfs: usize, optimal: usize) {
         assert_eq!(leaves(setup, Strategy::Dfs), dfs, "DFS leaf count");
         assert_eq!(
@@ -652,8 +568,7 @@ mod tests {
         });
     }
 
-    // Three processes, one shared cell, each a store: every order is observable, so
-    // all 3! = 6 interleavings are inequivalent — Optimal cannot reduce below DFS.
+    // Three stores to one cell: all 3! orders inequivalent, so Optimal == DFS.
     fn three_writers(world: &mut World) {
         let x = world.atomic("x", 0u32);
         for i in 1..=3u32 {
@@ -661,8 +576,8 @@ mod tests {
         }
     }
 
-    // A writer racing two readers on one cell: the readers commute with each other
-    // but each races the writer. DFS explores 3! = 6 orders; the classes are fewer.
+    // A writer racing two readers on one cell: the readers commute, each races the
+    // writer. DFS walks 3! = 6 orders; the classes are fewer.
     fn one_writer_two_readers(world: &mut World) {
         let x = world.atomic("x", 0u32);
         spawn_store(world, "writer", x.clone(), 1);
@@ -670,31 +585,11 @@ mod tests {
         spawn_load(world, "reader-2", x);
     }
 
-    // lastzero-style: a data-dependent reader whose control flow follows racy cells.
-    // Two writers each set their own cell; the reader loads both and the second load
-    // it issues depends on the first value — a program where classical Source-DPOR
-    // sleep-set-blocks but Optimal does not. (A toy; the parametric `lastzero` below
-    // is the POPL'14 benchmark.)
-    fn lastzero_toy(world: &mut World) {
-        let a = world.atomic("a", 0u32);
-        let b = world.atomic("b", 0u32);
-        spawn_store(world, "write-a", a.clone(), 1);
-        spawn_store(world, "write-b", b.clone(), 1);
-        world.spawn("reader", async move {
-            if a.load().await == 0 {
-                b.load().await;
-            }
-            Ok(())
-        });
-    }
-
-    // Flipping the x-race changes *which operations the reader issues*: on x == 0 it
-    // loads y, on x == 1 it stores y (itself racing write-y). A reversing fragment
-    // computed on one branch references an op that vanishes on the other — the
-    // hardest case for the pid-based wakeup tree (it stores process ids and
-    // re-resolves the concrete op by replay, so the diverged branch resolves its own
-    // ops). Stresses pid-vs-seq replay, the vanishing-fragment-event path, and a
-    // control-flow-dependent dependency at once.
+    // Flipping the x-race changes *which ops the reader issues*: on x == 0 it loads
+    // y, on x == 1 it stores y (itself racing write-y). A reversing fragment from one
+    // branch references an op that vanishes on the other — the hardest case for the
+    // pid-based wakeup tree, which stores pids and re-resolves the concrete op by
+    // replay.
     fn branch_changes_ops(world: &mut World) {
         let x = world.atomic("x", 0u32);
         let y = world.atomic("y", 0u32);
@@ -711,15 +606,12 @@ mod tests {
     }
 
     // --- POPL'14 benchmarks -----------------------------------------------------
-    // Direct ports of the Optimal DPOR paper's `readers` / `lastzero` / `indexer`
-    // (canonical C in refs/nidhugg/benchmarks). Each `.await` is one DPOR step, so
-    // these reproduce the paper's *optimal* column: the number of Mazurkiewicz
-    // classes Optimal must explore.
+    // Direct ports of the paper's `readers` / `lastzero` / `indexer`. Each `.await`
+    // is one DPOR step, so these reproduce the paper's *optimal* column (the number
+    // of Mazurkiewicz classes Optimal must explore).
 
-    // readers(N): one writer storing to `x`, N readers loading it. store/load are
-    // dependent, load/load independent, so each reader is independently on one side
-    // of the single store ⇒ 2^N classes. The C source's `idx[]` is per-thread arg
-    // plumbing, not a race, so it is not modeled.
+    // readers(N): one writer to `x`, N readers of it. store/load dependent, load/load
+    // independent, so each reader is independently on one side of the store ⇒ 2^N.
     fn readers(world: &mut World, n: usize) {
         let x = world.atomic("x", 0u32);
         spawn_store(world, "writer", x.clone(), 42);
@@ -728,10 +620,9 @@ mod tests {
         }
     }
 
-    // lastzero(N): one atomic per cell `a0..=aN` (distinct objects — the oid is what
-    // makes two cells independent). The reader scans top-down while it reads zero;
-    // writer j stores `load(a[j-1]) + 1` into `a[j]`. The reader's data-dependent
-    // control flow replays automatically. ⇒ (N+3)·2^(N-2) classes.
+    // lastzero(N): cells `a0..=aN` (distinct objects). The reader scans top-down
+    // while it reads zero; writer j stores `load(a[j-1]) + 1` into `a[j]`. The
+    // reader's data-dependent control flow replays automatically ⇒ (N+3)·2^(N-2).
     fn lastzero(world: &mut World, n: usize) {
         let cells = cells(world, "a", n + 1);
         let rc = cells.to_vec();
@@ -758,12 +649,10 @@ mod tests {
         }
     }
 
-    // indexer(NUM_THREADS): SIZE=128 hash-table cells (one atomic each), each thread
-    // inserts MAX=4 values with `w = (++m)*11 + tid` (pre-increment: m runs 1..=4),
-    // `h = (w*7) % 128`, probing h+1 on CAS failure. Our compare_exchange is already
-    // an atomic RMW, so the C `cas_mutex[]` is not modeled. Threads collide only once
-    // NUM_THREADS is large enough that two `w`s hash to the same slot — that is the
-    // only source of dependent ops. Branch on the Ok/Err discriminant, not the value.
+    // indexer(NUM_THREADS): 128 hash-table cells, each thread inserts MAX=4 values
+    // with `w = (++m)*11 + tid`, `h = (w*7) % 128`, probing h+1 on CAS failure. Our
+    // compare_exchange is already an atomic RMW, so the C `cas_mutex[]` is not
+    // modeled. Threads collide only once two `w`s hash to the same slot.
     fn indexer(world: &mut World, num_threads: usize) {
         let table = cells(world, "t", 128);
         for tid in 0..num_threads {
@@ -791,10 +680,8 @@ mod tests {
     }
 
     // A hand-built indexer-shaped collision: two threads CAS the same cell with
-    // distinct values, the loser probes the next cell. This exercises the same
-    // CAS-collision logic indexer relies on but is small enough to check against
-    // ground truth (assert_optimal runs exhaustive DFS, which is astronomical for
-    // the real indexer).
+    // distinct values, the loser probes the next cell. Same CAS-collision logic as
+    // indexer but small enough to check against ground truth.
     fn indexer_collision(world: &mut World, n: usize) {
         let cells = cells(world, "c", n + 1);
         for tid in 0..2 {
@@ -839,16 +726,8 @@ mod tests {
 
     #[test]
     fn reduces_writer_two_readers() {
-        // DFS walks all 6; the two readers commute, so there are fewer classes.
         assert!(leaves(&one_writer_two_readers, Strategy::Optimal) < 6);
         assert_optimal(&one_writer_two_readers);
-    }
-
-    #[test]
-    fn handles_lastzero() {
-        // The data-dependent benchmark: still exactly one trace per class.
-        assert_optimal(&lastzero_toy);
-        assert!(leaves(&lastzero_toy, Strategy::Optimal) <= leaves(&lastzero_toy, Strategy::Dfs));
     }
 
     #[test]
@@ -862,7 +741,7 @@ mod tests {
 
     #[test]
     fn finds_the_race() {
-        // Completeness: Optimal still reaches the stale-read failure DFS finds.
+        // Optimal still reaches the stale-read failure DFS finds, identically.
         let dfs = explore(&racy, &mut (), Strategy::Dfs).unwrap_err();
         let opt = explore(&racy, &mut (), Strategy::Optimal).unwrap_err();
         assert_eq!(opt.to_string(), dfs.to_string());
@@ -874,25 +753,8 @@ mod tests {
         assert_eq!(failed.to_string(), "deadlock");
     }
 
-    // Optimal reaches the same set of leaf outcomes as exhaustive DFS on a clean
-    // program — the differential soundness check, beyond bare counts.
-    #[test]
-    fn same_outcomes_as_dfs() {
-        for setup in [
-            &two_loaders as &dyn Fn(&mut World),
-            &two_objects,
-            &two_writers,
-            &three_writers,
-            &one_writer_two_readers,
-            &lastzero_toy,
-            &branch_changes_ops,
-        ] {
-            assert_optimal(setup);
-        }
-    }
-
     // --- POPL'14 benchmark counts -----------------------------------------------
-    // Small N: full ground-truth check (Optimal == #classes, run by exhaustive DFS).
+    // Small N: full ground-truth check (Optimal == #classes by exhaustive DFS).
     // Large N: assert the paper's exact *optimal* count directly (DFS unreachable).
 
     #[test]
@@ -938,8 +800,7 @@ mod tests {
         assert_eq!(leaves(&|w| lastzero(w, 15), Strategy::Optimal), 147456);
     }
 
-    // The CAS-collision logic indexer relies on, checked against ground truth on a
-    // tiny synthetic fixture (the real indexer is astronomical under DFS).
+    // The CAS-collision logic indexer relies on, checked against ground truth.
     #[test]
     fn indexer_collision_ground_truth() {
         assert_optimal(&|w| indexer_collision(w, 2));
