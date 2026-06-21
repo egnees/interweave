@@ -266,17 +266,6 @@ impl<'a> State<'a> {
             .collect()
     }
 
-    // Every process's next registered op, including ones not yet runnable (a
-    // receive blocked on an empty channel). DPOR's race detection needs these;
-    // deadlock detection and replay keep using `enabled` (runnable now).
-    pub(crate) fn pending_transitions(&self) -> Vec<Transition> {
-        self.world
-            .objects
-            .iter()
-            .flat_map(|o| o.pending())
-            .collect()
-    }
-
     // Transitions on different objects are independent; same-object pairs are the
     // object's call.
     pub(crate) fn depends(&self, t1: Transition, t2: Transition) -> bool {
@@ -284,15 +273,6 @@ impl<'a> State<'a> {
             return false;
         }
         self.world.objects[t1.oid].depends(t1, t2)
-    }
-
-    // Transitions on different objects can always coexist; a blocking primitive may
-    // rule out a same-object pair that is never simultaneously enabled.
-    pub(crate) fn co_enabled(&self, t1: Transition, t2: Transition) -> bool {
-        if t1.oid != t2.oid {
-            return true;
-        }
-        self.world.objects[t1.oid].co_enabled(t1, t2)
     }
 
     pub(crate) fn apply(&mut self, t: Transition) {

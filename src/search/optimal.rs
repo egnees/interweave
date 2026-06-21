@@ -68,8 +68,8 @@ impl Wut {
 // A DFS stack frame: metadata for the prefix E it describes, captured while E's
 // state was still live so the search can reason about E after stepping past it.
 // `sleep` is sleep(E) (mutable: filtered into children at descent, grown on
-// backtrack); `pending` / `enabled` are E's pending and enabled-pid snapshots,
-// used by the weak-initial guard against a maximal trace. No live `State` is kept
+// backtrack); `pending` is each enabled process's next op and `enabled` their
+// pids, used by the weak-initial guard against a maximal trace. No live `State` is kept
 // per frame — only the single `cur` is. `frames[m]` describes prefix `trace[..m]`,
 // so `frames.len() == prefix.len() + 1` (the root frame is always present).
 struct Frame {
@@ -100,7 +100,7 @@ pub(super) fn run<'a>(
     // The root frame (prefix length 0). `frames[m]` describes `trace[..m]`.
     let mut frames: Vec<Frame> = vec![Frame {
         sleep: Vec::new(),
-        pending: root.pending_transitions(),
+        pending: root.enabled(),
         enabled: enabled_pids(&root).into_iter().collect(),
     }];
     let mut cur = root;
@@ -155,7 +155,7 @@ pub(super) fn run<'a>(
         // are read from the live `cur` after the apply that produced it.
         frames.push(Frame {
             sleep: child_sleep,
-            pending: cur.pending_transitions(),
+            pending: cur.enabled(),
             enabled: enabled_pids(&cur).into_iter().collect(),
         });
         prefix.push(p_t);
@@ -347,9 +347,8 @@ fn notdep(clocks: &[Vec<usize>], trace: &[Transition], i: usize) -> Vec<Transiti
 }
 
 // Whether (trace[i-1], trace[j-1]) is a reversible race (i < j, 1-based): different
-// processes, dependent, a *direct* happens-before edge (no causal intermediary),
-// and the reversed process could have run instead (co-enabled — always true for
-// atomics, which never block).
+// processes, dependent, and a *direct* happens-before edge (no causal
+// intermediary).
 fn reversible_race(
     state: &State,
     clocks: &[Vec<usize>],
@@ -362,12 +361,7 @@ fn reversible_race(
         return false;
     }
     // Direct: no m with e →_E m →_E e' (such m lies strictly between i and j).
-    for m in (i + 1)..j {
-        if happens_before(clocks, trace, i, m) && happens_before(clocks, trace, m, j) {
-            return false;
-        }
-    }
-    state.co_enabled(e, ep)
+    !(i + 1..j).any(|m| happens_before(clocks, trace, i, m) && happens_before(clocks, trace, m, j))
 }
 
 // i →_E j (event i happens-before event j), for i < j: i ≤ clocks[j][proc(event i)].
@@ -427,9 +421,9 @@ fn enabled_pids(state: &State) -> BTreeSet<usize> {
     state.enabled().into_iter().map(|t| t.pid).collect()
 }
 
-// Process p's next registered op (runnable or not), or `None` if p has finished.
+// Process p's next op, or `None` if p has finished.
 fn resolve(state: &State, p: usize) -> Option<Transition> {
-    state.pending_transitions().into_iter().find(|t| t.pid == p)
+    state.enabled().into_iter().find(|t| t.pid == p)
 }
 
 // The wakeup-tree node reached by a child-index path. Each step indexes into
