@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 
 use super::explore::FailedState;
 use super::observer::Observer;
+use super::step::{RaceOutcome, Step, StepCx, StepObserver};
 use crate::model::{State, StateView, Transition};
 
 // One wakeup-tree node: children in ≺ (sibling) order, `children[0]` the ≺-minimal
@@ -22,12 +23,22 @@ use crate::model::{State, StateView, Transition};
 // consumed send-seq, which drifts across interleavings (a racy upstream op shifts a
 // later send's seq), so `check_initial` re-stamps a carried edge to a live op of the
 // same pid/object before testing it against the current trace.
+//
+// `pub(super)` (with a read accessor below) so the step-instrumentation module can
+// expose the live frontier tree through `WakeupNode`; the field stays private to this
+// module's writers and `Wut` itself never leaves `search`.
 #[derive(Default)]
-struct Wut {
+pub(super) struct Wut {
     children: Vec<(Transition, Wut)>,
 }
 
 impl Wut {
+    // Read access for step instrumentation: each child's planned edge and subtree.
+    // Wrapped by `WakeupNode` so a consumer never names `Wut`.
+    pub(super) fn children(&self) -> &[(Transition, Wut)] {
+        &self.children
+    }
+
     // Appends `seq` as a fresh branch after the existing children. Navigation
     // matches by head pid, so siblings must have distinct pids — `insert` only
     // reaches `graft` for a new pid.
@@ -50,14 +61,28 @@ impl Wut {
 // (filtered into children on descent, grown on backtrack); `pending` is each
 // enabled process's next op. `frames[m]` describes `trace[..m]`, so
 // `frames.len() == prefix.len() + 1` (the root frame is always present).
-struct Frame {
+//
+// `pub(super)` (with read accessors below) so the step-instrumentation module can
+// expose each depth's sleep + pending through `StepCx`; the fields stay private.
+pub(super) struct Frame {
     sleep: Vec<usize>,
     pending: Vec<Transition>,
 }
 
-pub(super) fn run<'a>(
+impl Frame {
+    pub(super) fn sleep(&self) -> &[usize] {
+        &self.sleep
+    }
+
+    pub(super) fn pending(&self) -> &[Transition] {
+        &self.pending
+    }
+}
+
+pub(super) fn run<'a, S: StepObserver>(
     root: State<'a>,
     observer: &mut impl Observer,
+    steps: &mut S,
 ) -> Result<(), FailedState<'a>> {
     observer.observe(&root);
     if root.is_failed() {
@@ -69,15 +94,23 @@ pub(super) fn run<'a>(
     let view = root.view();
 
     let mut tree = Wut::default();
-    // Seed the root with one enabled process (its sleep set is empty).
-    if let Some(p) = seed(&root, &[]) {
-        tree.graft(&[resolve(&root, p).expect("a seeded process must be runnable")]);
-    }
-
     let mut frames: Vec<Frame> = vec![Frame {
         sleep: Vec::new(),
         pending: root.enabled(),
     }];
+    // Seed the root with one enabled process (its sleep set is empty).
+    if let Some(p) = seed(&root, &[]) {
+        let seeded = resolve(&root, p).expect("a seeded process must be runnable");
+        tree.graft(&[seeded]);
+        steps.on(
+            Step::RootSeed { seeded },
+            StepCx::new(&tree, &frames, &[], &root),
+        );
+    } else {
+        steps.on(Step::RootEmpty, StepCx::new(&tree, &frames, &[], &root));
+        steps.on(Step::Done, StepCx::new(&tree, &frames, &[], &root));
+    }
+
     let mut cur = root;
     // `cur`'s transition prefix: push on apply, pop on backtrack. Its length is the
     // depth of `cur`'s node (a path of ≺-minimal children), and it feeds the single
@@ -89,7 +122,8 @@ pub(super) fn run<'a>(
         // An empty node means this frame is fully explored; popping past the root
         // ends the search.
         if node_at(&tree, prefix.len()).children.is_empty() {
-            if pop_exhausted(&mut tree, &mut frames, &mut prefix) {
+            if pop_exhausted(&mut tree, &mut frames, &mut prefix, &cur, steps) {
+                steps.on(Step::Done, StepCx::new(&tree, &frames, &prefix, &cur));
                 return Ok(());
             }
             need_replay = true;
@@ -99,6 +133,10 @@ pub(super) fn run<'a>(
         if need_replay {
             cur = view.replay(prefix.clone());
             need_replay = false;
+            steps.on(
+                Step::Replay { prefix: &prefix },
+                StepCx::new(&tree, &frames, &prefix, &cur),
+            );
         }
 
         // Explore the ≺-minimal child, re-resolving its op against the live `cur`
@@ -117,10 +155,33 @@ pub(super) fn run<'a>(
         cur.apply(p_t);
         observer.observe(&cur);
         if cur.is_failed() {
-            // A failed leaf is a maximal trace too; abort the search at it.
+            // A failed leaf is a maximal trace too; emit it (label-able: it is now
+            // committed) and abort the search at it. `cur.trace()` already includes
+            // the just-applied op, so it is exactly the maximal trace.
+            steps.on(
+                Step::Maximal {
+                    trace: cur.trace(),
+                    failure: true,
+                },
+                StepCx::new(&tree, &frames, &prefix, &cur),
+            );
             let (reason, view) = cur.into_failure();
             return Err(FailedState::new(reason, view));
         }
+
+        // depth == prefix.len() BEFORE the push; `committed` is now applied, so it is
+        // label-able. `parent_sleep` is still the parent frame (the push is below); a
+        // consumer derives the dropped sleepers as `parent_sleep \ child_sleep`.
+        steps.on(
+            Step::Descend {
+                depth: prefix.len(),
+                committed: p_t,
+                parent_sleep: frames.last().unwrap().sleep(),
+                child_sleep: &child_sleep,
+            },
+            StepCx::new(&tree, &frames, &prefix, &cur),
+        );
+
         frames.push(Frame {
             sleep: child_sleep,
             pending: cur.enabled(),
@@ -129,15 +190,23 @@ pub(super) fn run<'a>(
 
         if cur.enabled().is_empty() {
             // A maximal trace: plan every reversible race's reversal into the
-            // ancestor wakeup trees.
-            plan_reversals(&mut tree, &frames, &prefix, &cur, &view);
+            // ancestor wakeup trees. `prefix` now includes the just-pushed op, so it
+            // is the maximal trace.
+            steps.on(
+                Step::Maximal {
+                    trace: &prefix,
+                    failure: false,
+                },
+                StepCx::new(&tree, &frames, &prefix, &cur),
+            );
+            plan_reversals(&mut tree, &frames, &prefix, &cur, &view, steps);
             debug_assert!(
                 node_at(&tree, prefix.len()).children.is_empty(),
                 "a maximal trace's wakeup-tree node has no continuations"
             );
             need_replay = true;
         } else {
-            seed_child(&mut tree, prefix.len(), &cur, &frames.last().unwrap().sleep);
+            seed_child(&mut tree, &cur, &frames, &prefix, steps);
         }
     }
 }
@@ -145,7 +214,14 @@ pub(super) fn run<'a>(
 // Pops the exhausted top frame: drops the finished (≺-minimal) branch from the
 // parent and sleeps its head (Algorithm 2 line 17). Returns `true` when the popped
 // frame was the root, i.e. the whole search is done.
-fn pop_exhausted(tree: &mut Wut, frames: &mut Vec<Frame>, prefix: &mut Vec<Transition>) -> bool {
+fn pop_exhausted<S: StepObserver>(
+    tree: &mut Wut,
+    frames: &mut Vec<Frame>,
+    prefix: &mut Vec<Transition>,
+    cur: &State,
+    steps: &mut S,
+) -> bool {
+    let from_depth = prefix.len();
     frames.pop();
     let Some(finished_t) = prefix.pop() else {
         return true;
@@ -159,6 +235,15 @@ fn pop_exhausted(tree: &mut Wut, frames: &mut Vec<Frame>, prefix: &mut Vec<Trans
     );
     parent.children.remove(0);
     frames.last_mut().unwrap().sleep.push(finished);
+    // Surface the line-17 sleep growth: `finished` was slept into the parent frame.
+    steps.on(
+        Step::Pop {
+            finished_pid: finished,
+            from_depth,
+            into_depth: from_depth - 1,
+        },
+        StepCx::new(tree, frames, prefix, cur),
+    );
     false
 }
 
@@ -178,20 +263,36 @@ fn child_sleep_set(cur: &State, parent: &Frame, p_t: Transition) -> Vec<usize> {
 }
 
 // Seeds the child node with one enabled non-sleeping process, unless a race
-// already planted a fragment there.
-fn seed_child(tree: &mut Wut, depth: usize, cur: &State, child_sleep: &[usize]) {
-    if !node_at(tree, depth).children.is_empty() {
-        return;
+// already planted a fragment there. `depth == prefix.len()`; `child_sleep` is the
+// top frame's sleep. The emitted `seeded` is whatever process now heads the child
+// node — the freshly grafted one, or the one a race already planted — and `None`
+// only when the node is empty and nothing is runnable.
+fn seed_child<S: StepObserver>(
+    tree: &mut Wut,
+    cur: &State,
+    frames: &[Frame],
+    prefix: &[Transition],
+    steps: &mut S,
+) {
+    let depth = prefix.len();
+    let child_sleep = &frames.last().unwrap().sleep;
+    if node_at(tree, depth).children.is_empty() {
+        if let Some(q) = seed(cur, child_sleep) {
+            debug_assert!(
+                !child_sleep.contains(&q),
+                "sleep-set-blocked state under Optimal DPOR"
+            );
+            let q_t = resolve(cur, q).expect("a seeded process must be runnable");
+            node_at_mut(tree, depth).graft(&[q_t]);
+        }
     }
-    let Some(q) = seed(cur, child_sleep) else {
-        return;
-    };
-    debug_assert!(
-        !child_sleep.contains(&q),
-        "sleep-set-blocked state under Optimal DPOR"
+    // The child node's head edge after seeding (matched by pid; its seq drifts,
+    // so a consumer reads only the pid).
+    let seeded = node_at(tree, depth).children.first().map(|(t, _)| *t);
+    steps.on(
+        Step::SeedChild { depth, seeded },
+        StepCx::new(tree, frames, prefix, cur),
     );
-    let q_t = resolve(cur, q).expect("a seeded process must be runnable");
-    node_at_mut(tree, depth).graft(&[q_t]);
 }
 
 // Plans the reversal of every reversible race in the maximal trace `state`: for a
@@ -199,12 +300,13 @@ fn seed_child(tree: &mut Wut, depth: usize, cur: &State, child_sleep: &[usize]) 
 // prefix just before e, unless a process already asleep there covers it.
 // `frames[m]` describes `trace[..m]`, so E' = pre(E, e) for event i (1-based) is
 // `frames[i-1]` and its wut node sits at depth i-1.
-fn plan_reversals(
+fn plan_reversals<S: StepObserver>(
     tree: &mut Wut,
     frames: &[Frame],
     trace: &[Transition],
     state: &State,
     view: &StateView,
+    steps: &mut S,
 ) {
     let n = trace.len();
     let clocks = event_clocks(state, trace);
@@ -221,23 +323,50 @@ fn plan_reversals(
             // block); for a consuming send→recv it fails — e' (the recv) needs e (the send) to have
             // enqueued its message, so removing e disables e'. Done by replay so the strategy stays
             // primitive-agnostic, asking the model through `enabled` rather than knowing channels.
-            if !runnable_after(view, trace, &v, i) {
-                continue;
-            }
-            if covered_by_sleeper(state, &frames[i - 1], &v) {
-                continue;
-            }
-            insert(node_at_mut(tree, i - 1), state, &v);
+            //
+            // This if/else IS the algorithm (the same short-circuit `runnable_after` →
+            // `covered_by_sleeper` → `insert`); it merely also names the branch as a
+            // `RaceOutcome` (a free stack enum).
+            let outcome = if !runnable_after(view, trace, &v, i) {
+                RaceOutcome::NonDisabling
+            } else if let Some(covering_pid) = covered_by_sleeper(state, &frames[i - 1], &v) {
+                RaceOutcome::CoveredBySleeper {
+                    insert_depth: i - 1,
+                    covering_pid,
+                }
+            } else {
+                match insert(node_at_mut(tree, i - 1), state, &v) {
+                    InsertResult::ExistingLeaf => RaceOutcome::ExistingLeaf {
+                        insert_depth: i - 1,
+                    },
+                    InsertResult::Grafted => RaceOutcome::Grafted {
+                        insert_depth: i - 1,
+                    },
+                }
+            };
+            // `v` is still alive (insert took `&v`); borrow it and its notdep prefix.
+            steps.on(
+                Step::Race {
+                    i,
+                    j,
+                    e: trace[i - 1],
+                    ep: trace[j - 1],
+                    notdep: &v[..v.len() - 1],
+                    v: &v,
+                    outcome,
+                },
+                StepCx::new(tree, frames, trace, state),
+            );
         }
     }
 }
 
-// Algorithm 2 line 6: whether a process already asleep at prefix `pre` is a
-// weak-initial of `v`, in which case the reversal is already covered. `pending` is
-// `cur.enabled()` captured at `pre`, so a blocked recv is already excluded (it is not
-// enabled) — exactly the set this check needs.
-fn covered_by_sleeper(state: &State, pre: &Frame, v: &[Transition]) -> bool {
-    pre.sleep.iter().any(|&q| {
+// Algorithm 2 line 6: which process already asleep at prefix `pre` is a weak-initial
+// of `v` (covering the reversal), or `None` if none. `pending` is `cur.enabled()`
+// captured at `pre`, so a blocked recv is already excluded (it is not enabled) —
+// exactly the set this check needs.
+fn covered_by_sleeper(state: &State, pre: &Frame, v: &[Transition]) -> Option<usize> {
+    pre.sleep.iter().copied().find(|&q| {
         pre.pending
             .iter()
             .copied()
@@ -246,23 +375,31 @@ fn covered_by_sleeper(state: &State, pre: &Frame, v: &[Transition]) -> bool {
     })
 }
 
+// The terminal shape of an `insert`: a fresh branch was grafted, or an existing leaf
+// already covered v. Returned so the step hook can tell the two apart without
+// changing `insert`'s behavior.
+enum InsertResult {
+    Grafted,
+    ExistingLeaf,
+}
+
 // insert[E'](v): descends the branch that is the longest weak-initial prefix of v
 // (stripping each matched process), then grafts the residual as a new branch.
 // Dependency tests run against the maximal `state` (the carried transitions resolve
 // identically there), so no replay is needed while descending.
-fn insert(node: &mut Wut, state: &State, v: &[Transition]) {
+fn insert(node: &mut Wut, state: &State, v: &[Transition]) -> InsertResult {
     for idx in 0..node.children.len() {
         let q_t = node.children[idx].0;
         let Some(rest) = check_initial(state, q_t, v) else {
             continue; // q is not a weak-initial of v: try the next sibling.
         };
         if node.children[idx].1.children.is_empty() {
-            return; // an existing leaf already covers v.
+            return InsertResult::ExistingLeaf; // an existing leaf already covers v.
         }
-        insert(&mut node.children[idx].1, state, &rest);
-        return;
+        return insert(&mut node.children[idx].1, state, &rest);
     }
     node.graft(v);
+    InsertResult::Grafted
 }
 
 // Re-stamp a carried wakeup-tree edge to an op valid in `state`. The edge's seq is

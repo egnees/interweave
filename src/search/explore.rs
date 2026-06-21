@@ -1,6 +1,7 @@
 use std::{error::Error as StdError, fmt};
 
 use super::observer::Observer;
+use super::step::StepObserver;
 use crate::model::{FailureReason, State, StateView, World};
 
 /// The model-checking strategy [`explore`] runs.
@@ -39,8 +40,27 @@ pub fn explore<'a>(
     let root = StateView::new(setup).state();
     match strategy {
         Strategy::Dfs => dfs(root, observer),
-        Strategy::Optimal => super::optimal::run(root, observer),
+        Strategy::Optimal => super::optimal::run(root, observer, &mut ()),
     }
+}
+
+/// Like [`explore`] under [`Strategy::Optimal`], but with a [`StepObserver`] wired
+/// into the driver so a consumer can watch the algorithm's discrete decisions
+/// (descend, seed, race-reversal, pop, …) as they happen. The state-level
+/// [`Observer`](super::Observer) is the no-op `()`; this entry point exists for the
+/// step instrumentation a visualizer is built on. Re-exported as
+/// `interweave::explore_stepped` only under the `viz` feature.
+///
+/// [`StepObserver`]: super::step::StepObserver
+// Without `viz` it is unreachable from outside the crate (not re-exported); only the
+// golden test calls it. Re-exported and exercised by the renderer under `viz`.
+#[cfg_attr(not(feature = "viz"), allow(dead_code))]
+pub fn explore_stepped<'a>(
+    setup: &'a dyn Fn(&mut World<'a>),
+    steps: &mut impl StepObserver,
+) -> Result<(), FailedState<'a>> {
+    let root = StateView::new(setup).state();
+    super::optimal::run(root, &mut (), steps)
 }
 
 // The observer sees every state first — failed ones included — so it can read the failure reason

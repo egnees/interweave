@@ -89,3 +89,11 @@ pub use model::{
 };
 pub use search::{FailedState, Observer, Strategy, explore};
 pub use sync::{Atomic, Receiver, Sender};
+
+// The step-instrumentation hook for Optimal DPOR: the only public surface the `viz`
+// feature adds, and only when it is on. A consumer drives `explore_stepped(&setup,
+// &mut observer)` with its own [`StepObserver`] and reads each `Step<'_>` through the
+// borrowed `StepCx`/`WakeupNode` views — the external `unweave` crate's console
+// renderer is exactly such a consumer, built entirely on this public API.
+#[cfg(feature = "viz")]
+pub use search::{RaceOutcome, Step, StepCx, StepObserver, WakeupNode, explore_stepped};

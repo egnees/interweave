@@ -12,7 +12,14 @@ license = "MIT"
 keywords = ["dpor", "model-checking", "concurrency", "interleaving", "stateless"]
 categories = ["concurrency", "simulation", "development-tools::testing"]
 authors = ["Sergei Yakovlev <3gnees@gmail.com>"]
-exclude = ["/web", "/refs", "/.claude", "/.github"]
+exclude = ["/web", "/refs", "/.claude", "/.github", "/unweave"]
 
 [dependencies]
 thiserror = "2"
+
+[features]
+# Exposes the Optimal-DPOR step-instrumentation hook as a public API: the `Step`,
+# `StepCx`, `WakeupNode`, `StepObserver`, `RaceOutcome` re-exports and
+# `explore_stepped`. This crate ships no renderer of its own — the external
+# `unweave` crate (a pure consumer of these re-exports) is the visualizer.
+viz = []
