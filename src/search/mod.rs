@@ -5,9 +5,9 @@
 //! DPOR with [`Strategy`]. Pass an [`Observer`] to record the explored tree; the no-op `()`
 //! observer ignores everything.
 //!
-//! The strategy reaches the modeled system only through the public `model` surface (it touches
-//! neither the synchronization primitives nor the output layer), and communicates back to a
-//! recorder purely through typed [`Observer`] callbacks.
+//! The strategy reaches the modeled system only through the public `model` surface (never the
+//! synchronization primitives directly), and reports what it explores purely through typed
+//! [`Observer`] callbacks.
 
 mod explore;
 mod observer;
