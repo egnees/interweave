@@ -70,6 +70,8 @@ Runnable examples live in [`examples/`](examples):
 - `publish` — the program above, with the failing schedule printed out.
 - `bank` — two accounts and a non-atomic transfer; the auditor catches the money
   mid-transfer.
+- `custom_object` — define your own synchronization primitive by implementing
+  `Object` and registering it with `World::register`.
 - `readers` / `lastzero` / `indexer` — reproduce the POPL'14 Optimal-DPOR
   benchmark counts (one maximal trace per Mazurkiewicz class).
 
@@ -90,6 +92,7 @@ Three module layers, dependencies pointing downward (`search → model`, with
 
 - [x] Deterministic executor (futures + per-process wakers + FIFO driver)
 - [x] `Atomic` primitive with load / store / compare-exchange as yield points
+- [x] Custom primitives via the `Object` trait + `World::register` extension point
 - [x] Naive exhaustive DFS over interleavings (`explore`)
 - [x] Optimal DPOR (Abdulla et al., POPL'14) — wakeup trees + sleep sets and
       vector-clock happens-before; one trace per Mazurkiewicz class, no
