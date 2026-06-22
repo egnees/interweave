@@ -3,12 +3,10 @@
 //! `interweave` explores the interleavings of concurrent processes and checks
 //! that every one of them is correct. Processes are written as ordinary Rust
 //! [`Future`]s and driven by a custom single-threaded, deterministic executor.
-//! Synchronization primitives ([`Atomic`] and an MPSC channel: [`Sender`] /
-//! [`Receiver`]) are implemented
-//! from scratch so that every operation that can interact with another process
-//! becomes an explicit scheduling point — an `.await` that hands control back to
-//! the checker. The executor stays deliberately dumb; all interleaving control
-//! lives in the primitives and in the exploration strategy on top.
+//! Synchronization primitives — the built-in [`Atomic`] and an MPSC channel ([`Sender`] /
+//! [`Receiver`]) — are implemented from scratch so that every operation that can interact
+//! with another process becomes an explicit scheduling point: an `.await` that hands
+//! control back to the checker.
 //!
 //! That strategy is [**Optimal DPOR**](https://doi.org/10.1145/2535838.2535845)
 //! (Abdulla et al., POPL'14): it explores exactly one interleaving per
@@ -19,60 +17,46 @@
 //!
 //! # Example
 //!
-//! A `producer` hands a value to a `consumer` through a one-shot `ready` flag,
-//! but raises the flag *before* it writes the value. Optimal DPOR finds the
-//! interleaving where the consumer sees `ready` set yet reads the stale,
-//! not-yet-published value — the unsafe-publication race behind broken
-//! double-checked locking:
+//! A `writer` stores a value and a `reader` expects to see it — but nothing
+//! orders the two, so on the interleaving where the read beats the store the
+//! reader observes the initial value and fails. Optimal DPOR finds exactly that
+//! schedule:
 //!
 //! ```
 //! use interweave::{World, explore};
 //!
-//! fn publish(world: &mut World) {
-//!     let data = world.atomic("data", 0);
-//!     let ready = world.atomic("ready", 0);
-//!
-//!     let (data_w, ready_w) = (data.clone(), ready.clone());
-//!     world.spawn("producer", async move {
-//!         ready_w.store(1).await; // announce the value...
-//!         data_w.store(42).await; // ...before it has been written
+//! fn racy(world: &mut World) {
+//!     let x = world.atomic("x", 0);
+//!     let writer = x.clone();
+//!     world.spawn("writer", async move {
+//!         writer.store(1).await;
 //!         Ok(())
 //!     });
-//!
-//!     world.spawn("consumer", async move {
-//!         // No wait loop: the checker explores the schedule where the flag is
-//!         // already set, so a single guarded read stays a finite safety check.
-//!         if ready.load().await == 1 {
-//!             let v = data.load().await;
-//!             if v != 42 {
-//!                 return Err(format!("read the value before it was published: {v}").into());
-//!             }
+//!     world.spawn("reader", async move {
+//!         match x.load().await {
+//!             1 => Ok(()),
+//!             v => Err(format!("read {v} before the store landed").into()),
 //!         }
-//!         Ok(())
 //!     });
 //! }
 //!
-//! // `()` is the no-op observer; Optimal DPOR finds the schedule where the
-//! // consumer sees `ready == 1` but still reads the stale `data`.
-//! explore(&publish, &mut ()).expect_err("publishes the flag before the value");
+//! // `()` is the no-op observer. Optimal DPOR finds the schedule where the
+//! // reader runs first and sees the initial `0`.
+//! explore(&racy, &mut ()).expect_err("the reader can run before the writer");
 //! ```
 //!
-//! # Architecture
+//! # How it fits together
 //!
-//! Three module layers, dependencies pointing downward (`search → model`, with
-//! `model ↔ sync` a deliberate mutual pair):
-//!
-//! - **`model`** — the modeled system and its execution: the deterministic executor, the [`World`]
-//!   / [`State`] a program builds, the [`Transition`] the strategy picks, and the [`ProcessError`]
-//!   / [`FailureReason`] verdicts.
-//! - **`sync`** — synchronization primitives whose every observable operation is an `.await` yield
-//!   point: [`Atomic`] and an unbounded MPSC channel ([`Sender`] / [`Receiver`]).
-//! - **`search`** — the exploration algorithm: [`explore`] runs Optimal DPOR, reports the first
-//!   [`FailedState`], and calls an [`Observer`] at every visited state. The same [`Observer`] also
-//!   exposes [`Observer::step`], an always-available callback fired at each of the driver's
-//!   discrete decisions (descend, seed, race-reversal, pop, …) and consumed through the public
-//!   [`Step`] / [`StepCx`] / [`WakeupNode`] / [`RaceOutcome`] types; its default is a no-op, so a
-//!   state-only observer pays nothing and a visualizer is built entirely on this surface.
+//! - **Build** a program on a [`World`]: [`spawn`](World::spawn) the processes and create the
+//!   shared objects they communicate through.
+//! - **Communicate** through synchronization primitives whose every observable operation is a
+//!   scheduling point — the built-in [`Atomic`] and unbounded MPSC channel ([`Sender`] /
+//!   [`Receiver`]), or your own via [`Object`] and [`World::register`].
+//! - **Explore** with [`explore`]: it runs Optimal DPOR over the program and returns the first
+//!   [`FailedState`], or `Ok(())` if no interleaving fails. An [`Observer`] watches the search
+//!   through one [`Observer::step`] callback fired at each decision the algorithm makes — a
+//!   [`Step::Visit`] for every state it reaches and a [`Step::Maximal`] for every complete
+//!   interleaving, among other [`Step`] cases — delivered with a [`StepCx`] view.
 //!
 //! # Custom synchronization objects
 //!
