@@ -5,24 +5,26 @@
 [![docs.rs](https://img.shields.io/docsrs/interweave)](https://docs.rs/interweave)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Stateless model-checking sandbox — watch Optimal DPOR explore the interleavings
-of small concurrent programs, modeled as `Future`s on a deterministic,
-from-scratch executor.
+Stateless model-checking sandbox — watch Optimal DPOR explore every interleaving
+of a small concurrent program and find the one that breaks it.
 
 ## What it is
 
-A research sandbox for **stateless model checking** of concurrent programs.
-Processes are Rust `Future`s driven by a custom single-threaded, deterministic
-executor. Synchronization primitives (`Atomic` now, channels later)
-are implemented from scratch so that every operation that may interact with
-another process becomes an explicit scheduling point — a `.await` that hands
-control back to the executor. The executor stays deliberately dumb; all
-interleaving control lives in the primitives and in the exploration strategy on
-top, which is where Optimal DPOR lives.
+A research sandbox for **stateless model checking** of concurrent programs. You
+write a handful of processes as ordinary async Rust and let them communicate
+through the synchronization primitives the crate provides — atomics, an MPSC
+channel, or one of your own. `explore` then runs the program under every
+meaningfully distinct schedule and reports the first one that fails — a genuine
+concurrency bug, replayable exactly — or, when none does, proves that no
+interleaving can break it.
+
+The exploration strategy is **Optimal DPOR** (Abdulla et al., POPL'14): it
+visits exactly one interleaving per equivalence class, so the search stays
+exhaustive without the combinatorial blow-up of enumerating every ordering.
 
 ## Usage
 
-Write a concurrent program against `World` / `Atomic`, then `explore` every
+Write a concurrent program against `World`, then `explore` every
 interleaving. The result is `Ok` if all of them pass, or the first failing one.
 Here a `producer` hands a value to a `consumer` through a `ready` flag, but
 raises the flag *before* it has written the value — so Optimal DPOR finds the
