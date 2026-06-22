@@ -17,11 +17,11 @@ pub(crate) use executor::{Executor, pid};
 
 use crate::sync::{Atomic, ChannelHandle, Receiver, Sender};
 
-/// The program under test: a builder owning its processes and synchronization
-/// objects. A setup closure populates it via [`spawn`](World::spawn) and
-/// [`atomic`](World::atomic); the same closure is re-run on every replay, so it
-/// must build the same objects in the same order — ids are assigned by insertion
-/// order, and that fixed order is what makes replay deterministic.
+/// The program under test: a builder that owns the processes and synchronization
+/// objects created on it. A setup closure populates it via [`spawn`](World::spawn),
+/// [`atomic`](World::atomic), and [`channel`](World::channel). That closure must be
+/// deterministic — building the same objects in the same order every time — because
+/// the search runs it repeatedly to explore different schedules.
 #[derive(Default)]
 pub struct World<'a> {
     objects: Vec<Box<dyn Object>>,
@@ -32,7 +32,8 @@ pub struct World<'a> {
 
 impl<'a> World<'a> {
     /// Registers a named process. Every `.await` on a synchronization primitive
-    /// inside `code` is a scheduling point. The name appears in traces and reports.
+    /// inside `code` is a scheduling point. The name identifies this process wherever
+    /// its [`Transition`]s are shown.
     pub fn spawn(
         &mut self,
         name: impl Into<String>,
@@ -64,14 +65,15 @@ impl<'a> World<'a> {
         driver.split()
     }
 
-    /// Registers a custom synchronization object, returning the cloneable handle
-    /// the program shares among its processes.
+    /// Registers a custom synchronization object and returns the cloneable handle
+    /// your processes share.
     ///
-    /// `build` receives the [`ObjectID`] the world assigns and returns a handle
-    /// implementing [`Object`]; the world keeps one clone to drive and gives this
-    /// one back. The handle's clones must share state (see [`Object`]). This is the
-    /// open extension point behind [`atomic`](World::atomic) — implement [`Object`]
-    /// for your own lock, channel, or barrier and register it here.
+    /// `build` receives the [`ObjectID`] assigned to the object and returns a handle
+    /// implementing [`Object`]; the handle's clones must all share one underlying state
+    /// (e.g. an `Rc<RefCell<…>>`), so every process operating on the object sees the same
+    /// cell. This is the extension point behind [`atomic`](World::atomic) and
+    /// [`channel`](World::channel) — implement [`Object`] for your own lock, channel, or
+    /// barrier and register it here.
     pub fn register<O>(&mut self, name: impl Into<String>, build: impl FnOnce(ObjectID) -> O) -> O
     where
         O: Object + Clone + 'static,
@@ -94,6 +96,7 @@ impl<'a> World<'a> {
     }
 
     /// A human-readable label for a *committed* [`Transition`] (e.g. `"load -> 123"`).
+    /// Panics on a transition that has not committed.
     pub fn label(&self, t: &Transition) -> String {
         self.objects[t.oid].label(t)
     }
@@ -135,9 +138,8 @@ impl ProcessError {
     }
 }
 
-/// Why a settled [`State`] makes no further progress. A `State` reports this via
-/// [`failure_reason`](State::failure_reason), so the search layer sees failed and
-/// healthy states through one interface.
+/// Why a [`State`] makes no further progress, as reported by
+/// [`State::failure_reason`] and carried by a [`FailedState`](crate::FailedState).
 #[derive(Debug, thiserror::Error)]
 pub enum FailureReason {
     /// A process future returned an error.
@@ -148,12 +150,11 @@ pub enum FailureReason {
     Deadlock,
 }
 
-/// A node in the search tree: a [`World`] advanced along a [`Transition`] trace.
-///
-/// Construction runs the setup closure and the executor to the first scheduling
-/// point; the search layer steps it forward one transition at a time. States
-/// cannot be cloned (process futures cannot) — the search layer rebuilds them by
-/// replaying a trace.
+/// A node in the search tree: the program after a sequence of [`Transition`]s has been
+/// applied. An [`Observer`](crate::Observer) receives one at every state the search
+/// reaches and inspects it — its [`trace`](State::trace), its [`world`](State::world)
+/// for resolving names and labels, whether it [`is_terminal`](State::is_terminal), and
+/// any [`failure_reason`](State::failure_reason).
 pub struct State<'a> {
     world: World<'a>,
     setup: &'a dyn Fn(&mut World<'a>),
@@ -270,11 +271,12 @@ impl<'a> State<'a> {
     /// dependent ones must be explored in both orders. Use it to reconstruct
     /// happens-before over a trace (e.g. for a visualization or a custom analysis).
     ///
-    /// Transitions on different objects are always independent — sound because the model
-    /// is "one transition touches exactly one object", so no single step can couple two;
-    /// same-object pairs defer to the object's own [`Object::depends`]. Evaluate it on a
-    /// state where both transitions occur (e.g. a maximal trace): for some primitives
-    /// (channels) the relation depends on the committed history.
+    /// Evaluate it on a state where both transitions have occurred (e.g. a maximal trace):
+    /// for history-sensitive primitives (channels) the answer depends on the committed
+    /// history, so calling it elsewhere may silently mislead. Transitions on different
+    /// objects are always independent — the model guarantees one transition touches
+    /// exactly one object, so no single step couples two — while same-object pairs defer
+    /// to the object's own [`Object::depends`].
     pub fn depends(&self, t1: Transition, t2: Transition) -> bool {
         t1.oid == t2.oid && self.world.objects[t1.oid].depends(t1, t2)
     }

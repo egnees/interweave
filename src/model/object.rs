@@ -14,13 +14,12 @@ pub type ObjectID = usize;
 /// One schedulable step: a process performing one observable operation on one
 /// synchronization object — the unit the search picks at each scheduling point.
 ///
-/// It carries the operating process, the target object, and a per-object `seq`
-/// that tells the object's several concurrent operations apart — unique per
-/// registration on the object, across all processes. A custom [`Object`] builds one
-/// with [`Transition::new`] when an awaited
-/// operation registers itself, stores it, and hands the same value back from
-/// [`Object::enabled`]; the model later returns it to [`Object::apply`]. Identity
-/// is by value, so an object matches a transition simply with `==`.
+/// It carries the operating process, the target object, and a per-object `seq` that
+/// tells the object's several concurrent operations apart. A custom [`Object`] builds
+/// one with [`Transition::new`] when an awaited operation registers itself, stores it,
+/// and hands the same value back from [`Object::enabled`]; the model later returns it
+/// to [`Object::apply`]. Identity is by value, so an object matches a transition
+/// simply with `==`.
 #[derive(Eq, PartialEq, Hash, Clone, Copy, Debug)]
 pub struct Transition {
     pub(crate) pid: process::ProcessID,
@@ -40,7 +39,8 @@ impl Transition {
     /// the whole search, so use a per-object counter that bumps on every
     /// registration and never reuses a value for the object's lifetime (what
     /// [`Atomic`](crate::Atomic) does). Reusing one after its transition was retired
-    /// would alias two distinct operations and break deterministic replay.
+    /// would alias two distinct operations and break the checker's deterministic
+    /// re-execution.
     pub fn new(oid: ObjectID, seq: usize) -> Self {
         Self {
             pid: pid(),
@@ -60,7 +60,7 @@ impl Transition {
     }
 
     /// The per-object sequence number distinguishing the object's concurrent
-    /// operations; unique per registration on the object, across all processes.
+    /// operations.
     pub fn seq(&self) -> usize {
         self.seq
     }
@@ -72,8 +72,8 @@ impl Transition {
 /// Implement this to add your own primitive — a lock, a channel, a barrier — next
 /// to the built-in [`Atomic`](crate::Atomic), then register it with
 /// [`World::register`](crate::World::register). These four methods are the *entire*
-/// contract between a primitive and the search layer: everything the strategy
-/// knows about your primitive it learns through them.
+/// contract between a primitive and the checker: everything the checker knows about
+/// your primitive it learns through them.
 ///
 /// # The operation lifecycle
 ///
@@ -87,8 +87,7 @@ impl Transition {
 /// object's state, records what happened so [`label`](Object::label) can describe
 /// it, and wakes the process so its `.await` resolves. Splitting registration from
 /// commit is what lets the strategy decide *when* each operation takes effect
-/// relative to the others; [`Atomic`](crate::Atomic)'s source is the worked
-/// reference for this pattern.
+/// relative to the others.
 ///
 /// # Shared state
 ///
@@ -99,7 +98,7 @@ impl Transition {
 ///
 /// # Determinism
 ///
-/// Replay rebuilds states by re-running the program and re-applying a trace, so
+/// The checker rebuilds states by re-running the program and re-applying a trace, so
 /// every method must be a deterministic function of the operations applied so far:
 /// [`enabled`](Object::enabled) must list transitions in a fixed order, and `seq`
 /// identities must be assigned the same way on every run.
@@ -133,10 +132,10 @@ pub trait Object {
     /// *unsound* — it can hide reachable states — so when in doubt, return `true`.
     ///
     /// The relation may depend on committed state, not only on the two operations'
-    /// kinds — a channel `recv`, say, conflicts with a `send` only when it consumed
-    /// that send — so the search only ever asks about a pair drawn from one committed
-    /// (maximal or replayed) trace, and the object resolves each operation from its
-    /// own recorded history.
+    /// kinds — a channel `recv`, say, conflicts with a `send` only when it consumed that
+    /// send. The search asks about a process's next (still-pending) operation as well as
+    /// already-committed ones, so resolve each from your pending requests or your recorded
+    /// history, as the built-ins do.
     ///
     /// Only ever called for two transitions on this same object; the model treats
     /// operations on different objects as independent.
