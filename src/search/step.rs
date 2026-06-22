@@ -1,34 +1,17 @@
-//! Step instrumentation for the Optimal DPOR driver: a typed callback that emits the
-//! algorithm's discrete decisions (descend, seed, race-reversal, pop, …) as they
-//! happen, mirroring the `Observer` pattern. The `()` impl is a no-op, so normal
-//! `explore` pays nothing — every emit site passes a borrowed `Step<'_>` referencing
-//! data the driver already holds, so the no-op path allocates nothing.
+//! Step instrumentation for the Optimal DPOR driver: the typed data the algorithm's
+//! discrete decisions (descend, seed, race-reversal, pop, …) carry. Each one feeds
+//! [`Observer::step`](super::Observer::step), invoked at every decision the driver
+//! makes — the default no-op `step` means plain `explore` pays nothing, since every
+//! emit site passes a borrowed `Step<'_>` referencing data the driver already holds
+//! and an observer that ignores steps reads none of it.
 //!
-//! Public, feature-gated (`viz`): a visualizer is built *on top of* the crate, the
-//! same way an external consumer would. The renderer itself lives in the
-//! `optimal_viz` bin, a pure consumer of this hook plus the public `model` surface.
-
-// Without `viz` these items are `pub` but not re-exported, so they are unreachable
-// from outside the crate and the no-op `()::on` reads none of `Step`'s fields. They
-// are the public hook the `viz` consumer (and the golden test) exercises in full.
-#![allow(dead_code)]
+//! The `step` module stays private; these items are surfaced through the public
+//! re-exports in `search` / the crate root, so a visualizer is built *on top of* the
+//! crate — a pure consumer of [`Observer::step`](super::Observer::step) plus the
+//! public `model` surface, the same way any external consumer would.
 
 use super::optimal::{Frame, Wut};
 use crate::model::{ObjectID, ProcessID, State, Transition};
-
-// The step callback: invoked at every discrete decision of the Optimal driver. The
-// consumer reaches the model only through `cx` (names/labels via the `State`), never
-// into primitive internals. `Step` borrows the driver's live data, so the no-op `()`
-// impl pays nothing.
-pub trait StepObserver {
-    fn on(&mut self, step: Step<'_>, cx: StepCx<'_, '_>);
-}
-
-// The no-op observer the default `explore` uses: an empty `on`, so every emit site
-// monomorphizes away and `()` allocates nothing.
-impl StepObserver for () {
-    fn on(&mut self, _step: Step<'_>, _cx: StepCx<'_, '_>) {}
-}
 
 // The live state a consumer needs at any step: the frontier wakeup tree, the
 // per-depth sleep + pending, the surviving prefix, and the live `State` for name and
@@ -213,10 +196,10 @@ pub enum Step<'a> {
 mod tests {
     use std::fmt::Write as _;
 
-    use super::super::explore::explore_stepped;
-    use super::{RaceOutcome, Step, StepCx, StepObserver};
+    use super::{RaceOutcome, Step, StepCx};
     use crate::Atomic;
-    use crate::model::World;
+    use crate::model::{State, World};
+    use crate::search::{Observer, explore};
 
     fn spawn_store<'a>(world: &mut World<'a>, name: &str, cell: Atomic<u32>, value: u32) {
         world.spawn(name.to_string(), async move {
@@ -264,8 +247,11 @@ mod tests {
         names(cx, &ts.iter().map(|t| t.pid()).collect::<Vec<_>>())
     }
 
-    impl StepObserver for Recorder {
-        fn on(&mut self, step: Step<'_>, cx: StepCx<'_, '_>) {
+    impl Observer for Recorder {
+        // Only records steps; ignores states.
+        fn observe(&mut self, _state: &State) {}
+
+        fn step(&mut self, step: Step<'_>, cx: StepCx<'_, '_>) {
             let mut line = String::new();
             match step {
                 Step::RootSeed { seeded } => {
@@ -364,7 +350,7 @@ mod tests {
     #[test]
     fn one_writer_two_readers_step_stream() {
         let mut rec = Recorder::default();
-        let res = explore_stepped(&one_writer_two_readers, &mut rec);
+        let res = explore(&one_writer_two_readers, &mut rec);
         assert!(res.is_ok(), "fixture explores cleanly");
 
         let expected = [

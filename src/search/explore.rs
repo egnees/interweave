@@ -1,7 +1,6 @@
 use std::{error::Error as StdError, fmt};
 
 use super::observer::Observer;
-use super::step::StepObserver;
 use crate::model::{FailureReason, State, StateView, World};
 
 /// Enumerates interleavings of the program built by `setup` under Optimal DPOR.
@@ -18,26 +17,7 @@ pub fn explore<'a>(
     observer: &mut impl Observer,
 ) -> Result<(), FailedState<'a>> {
     let root = StateView::new(setup).state();
-    super::optimal::run(root, observer, &mut ())
-}
-
-/// Like [`explore`] (Optimal DPOR), but with a [`StepObserver`] wired
-/// into the driver so a consumer can watch the algorithm's discrete decisions
-/// (descend, seed, race-reversal, pop, …) as they happen. The state-level
-/// [`Observer`](super::Observer) is the no-op `()`; this entry point exists for the
-/// step instrumentation a visualizer is built on. Re-exported as
-/// `interweave::explore_stepped` only under the `viz` feature.
-///
-/// [`StepObserver`]: super::step::StepObserver
-// Without `viz` it is unreachable from outside the crate (not re-exported); only the
-// golden test calls it. Re-exported and exercised by the renderer under `viz`.
-#[cfg_attr(not(feature = "viz"), allow(dead_code))]
-pub fn explore_stepped<'a>(
-    setup: &'a dyn Fn(&mut World<'a>),
-    steps: &mut impl StepObserver,
-) -> Result<(), FailedState<'a>> {
-    let root = StateView::new(setup).state();
-    super::optimal::run(root, &mut (), steps)
+    super::optimal::run(root, observer)
 }
 
 /// A reproducible failure returned by [`explore`].

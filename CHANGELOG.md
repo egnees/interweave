@@ -20,6 +20,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   synchronization primitives (the built-in `Atomic` is one such primitive).
 - `explore` entry point running Optimal DPOR (Abdulla et al., POPL'14).
 - `Observer` hook called at every explored state (`&mut ()` to observe nothing).
+  Its `step` method (default no-op) additionally fires at each of the Optimal
+  driver's discrete decisions, carrying the public `Step` / `StepCx` / `WakeupNode`
+  / `RaceOutcome` types — the surface a visualizer is built on.
 - Examples: `publish` and `bank` (the checker finding an unsafe-publication and a
   non-atomic transfer bug), `custom_object` (a from-scratch primitive via the
   `Object` / `World::register` extension point), `rpc_mux` (an RPC connection

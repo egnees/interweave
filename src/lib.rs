@@ -68,7 +68,11 @@
 //! - **`sync`** — synchronization primitives whose every observable operation is an `.await` yield
 //!   point: [`Atomic`] and an unbounded MPSC channel ([`Sender`] / [`Receiver`]).
 //! - **`search`** — the exploration algorithm: [`explore`] runs Optimal DPOR, reports the first
-//!   [`FailedState`], and calls an [`Observer`] at every visited state.
+//!   [`FailedState`], and calls an [`Observer`] at every visited state. The same [`Observer`] also
+//!   exposes [`Observer::step`], an always-available callback fired at each of the driver's
+//!   discrete decisions (descend, seed, race-reversal, pop, …) and consumed through the public
+//!   [`Step`] / [`StepCx`] / [`WakeupNode`] / [`RaceOutcome`] types; its default is a no-op, so a
+//!   state-only observer pays nothing and a visualizer is built entirely on this surface.
 //!
 //! # Custom synchronization objects
 //!
@@ -86,13 +90,5 @@ pub use model::{
     FailureReason, Object, ObjectID, ProcessError, ProcessID, ProcessResult, State, Transition,
     World,
 };
-pub use search::{FailedState, Observer, explore};
+pub use search::{FailedState, Observer, RaceOutcome, Step, StepCx, WakeupNode, explore};
 pub use sync::{Atomic, Receiver, Sender};
-
-// The step-instrumentation hook for Optimal DPOR: the only public surface the `viz`
-// feature adds, and only when it is on. A consumer drives `explore_stepped(&setup,
-// &mut observer)` with its own [`StepObserver`] and reads each `Step<'_>` through the
-// borrowed `StepCx`/`WakeupNode` views — the external `unweave` crate's console
-// renderer is exactly such a consumer, built entirely on this public API.
-#[cfg(feature = "viz")]
-pub use search::{RaceOutcome, Step, StepCx, StepObserver, WakeupNode, explore_stepped};

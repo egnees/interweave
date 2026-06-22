@@ -16,14 +16,7 @@ mod step;
 pub use explore::{FailedState, explore};
 pub use observer::Observer;
 
-// The step-instrumentation hook: a public, `viz`-gated API a visualizer builds on
-// top of (the renderer lives in the external `unweave` crate). The `step`/`explore`
-// modules stay private; the items are `pub` and surfaced only through these
-// re-exports. The
-// always-compiled internals (`optimal.rs`, `explore.rs`, the `step.rs` golden test)
-// reach them via direct module paths, so a no-`viz` build still compiles and tests.
-#[cfg(feature = "viz")]
-pub use {
-    explore::explore_stepped,
-    step::{RaceOutcome, Step, StepCx, StepObserver, WakeupNode},
-};
+// The step types are the public hook for [`Observer::step`]: a consumer reads each
+// `Step<'_>` through the borrowed `StepCx` / `WakeupNode` views. The `step` module
+// stays private; these items are surfaced only through this re-export.
+pub use step::{RaceOutcome, Step, StepCx, WakeupNode};
