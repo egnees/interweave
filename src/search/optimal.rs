@@ -10,8 +10,7 @@
 use std::collections::BTreeSet;
 
 use super::explore::FailedState;
-use super::observer::Observer;
-use super::step::{RaceOutcome, Step, StepCx};
+use super::observer::{Observer, RaceOutcome, Step, StepCx};
 use crate::model::{State, StateView, Transition};
 
 // One wakeup-tree node: children in ≺ (sibling) order, `children[0]` the ≺-minimal
