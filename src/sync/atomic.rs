@@ -179,8 +179,8 @@ impl<T: Copy + PartialEq + Debug> Handle<T> {
     ///
     /// Awaiting this is a scheduling point: the read commits when the strategy selects this
     /// operation's [`Transition`], and the returned value is whatever the cell holds at that
-    /// moment. Two loads on the same cell are independent (they commute), so the search layer need
-    /// not reorder them against each other.
+    /// moment. Two loads on the same cell are independent (they commute), so the
+    /// search need not explore both of their orderings.
     pub async fn load(&self) -> T {
         self.request(Op::Load).await
     }
@@ -191,9 +191,8 @@ impl<T: Copy + PartialEq + Debug> Handle<T> {
     /// intervening store from another process is observed. Returns the value seen at commit:
     /// `Ok(current)` if the swap happened, `Err(actual)` otherwise.
     ///
-    /// Awaiting this is a scheduling point, and the operation is treated as a potential write
-    /// (hence dependent with other writes and loads) regardless of whether the swap ultimately
-    /// succeeds.
+    /// The operation is treated as a potential write — dependent with other writes and
+    /// loads — even when the swap ultimately fails.
     pub async fn compare_exchange(&self, current: T, new: T) -> Result<T, T> {
         let prev = self.request(Op::CompareExchange { current, new }).await;
         if prev == current { Ok(prev) } else { Err(prev) }

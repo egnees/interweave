@@ -8,14 +8,8 @@
 mod atomic;
 mod channel;
 
-/// A cloneable handle to a shared atomic cell whose operations are DPOR scheduling points.
-///
-/// See [`atomic::Handle`] for the operation semantics.
 pub use atomic::Handle as Atomic;
 
-/// The producer / consumer halves of an unbounded MPSC channel whose `send` / `recv`
-/// operations are DPOR scheduling points. See [`channel::Sender`] / [`channel::Receiver`] for
-/// the semantics.
 pub use channel::{Receiver, Sender};
 
 pub(crate) use channel::ChannelHandle;

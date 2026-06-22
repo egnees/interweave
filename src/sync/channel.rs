@@ -277,9 +277,8 @@ impl<T: Debug> Sender<T> {
 /// The receiving half of an MPSC channel. Deliberately **not** `Clone`: the dependency relation
 /// relies on there being a single consumer, and `!Clone` enforces that at the type level.
 ///
-/// [`recv`](Receiver::recv) is an `async` method: awaiting it registers the recv and yields. A recv
-/// on an empty channel stays blocked (withheld from the enabled set) until a send makes the queue
-/// non-empty and the strategy selects this recv.
+/// [`recv`](Receiver::recv) is an `async` method: awaiting it registers the recv and yields,
+/// blocking while the channel is empty.
 pub struct Receiver<T> {
     chan: Rc<RefCell<Channel<T>>>,
 }
