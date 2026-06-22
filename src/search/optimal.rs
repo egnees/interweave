@@ -82,7 +82,14 @@ pub(super) fn run<'a>(
     root: State<'a>,
     observer: &mut impl Observer,
 ) -> Result<(), FailedState<'a>> {
-    observer.observe(&root);
+    // Build the empty wut + root frame first so the root `Visit` can carry them; this
+    // is harmless before the failed-root check (both are empty/derived from `root`).
+    let mut tree = Wut::default();
+    let mut frames: Vec<Frame> = vec![Frame {
+        sleep: Vec::new(),
+        pending: root.enabled(),
+    }];
+    observer.step(Step::Visit, StepCx::new(&tree, &frames, &[], &root));
     if root.is_failed() {
         let (reason, view) = root.into_failure();
         return Err(FailedState::new(reason, view));
@@ -91,11 +98,6 @@ pub(super) fn run<'a>(
     // The view carries `setup`; replays rebuild `cur` from a transition prefix.
     let view = root.view();
 
-    let mut tree = Wut::default();
-    let mut frames: Vec<Frame> = vec![Frame {
-        sleep: Vec::new(),
-        pending: root.enabled(),
-    }];
     // Seed the root with one enabled process (its sleep set is empty).
     if let Some(p) = seed(&root, &[]) {
         let seeded = resolve(&root, p).expect("a seeded process must be runnable");
@@ -151,7 +153,7 @@ pub(super) fn run<'a>(
         let child_sleep = child_sleep_set(&cur, frames.last().unwrap(), p_t);
 
         cur.apply(p_t);
-        observer.observe(&cur);
+        observer.step(Step::Visit, StepCx::new(&tree, &frames, &prefix, &cur));
         if cur.is_failed() {
             // A failed leaf is a maximal trace too; emit it (label-able: it is now
             // committed) and abort the search at it. `cur.trace()` already includes
@@ -326,7 +328,7 @@ fn plan_reversals(
             // `covered_by_sleeper` → `insert`); it merely also names the branch as a
             // `RaceOutcome` (a free stack enum).
             let outcome = if !runnable_after(view, trace, &v, i) {
-                RaceOutcome::NonDisabling
+                RaceOutcome::Disabling
             } else if let Some(covering_pid) = covered_by_sleeper(state, &frames[i - 1], &v) {
                 RaceOutcome::CoveredBySleeper {
                     insert_depth: i - 1,
@@ -579,15 +581,22 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt::Debug;
 
-    use super::{State, StateView, event_clocks, happens_before};
+    use super::{Frame, State, StateView, Wut, event_clocks, happens_before};
     use crate::Atomic;
     use crate::model::World;
-    use crate::search::{FailedState, Observer, explore};
+    use crate::search::{FailedState, Observer, Step, StepCx, explore};
 
     // Exhaustive DFS over every interleaving — the ground-truth oracle Optimal is
     // checked against. Mirrors the old public driver, kept test-only.
     fn dfs<'a>(state: State<'a>, observer: &mut impl Observer) -> Result<(), FailedState<'a>> {
-        observer.observe(&state);
+        // The oracle has no wakeup tree/frames, so it builds empty locals and passes
+        // the state's own trace as the prefix for the `Visit` `StepCx`.
+        let tree = Wut::default();
+        let frames: Vec<Frame> = Vec::new();
+        observer.step(
+            Step::Visit,
+            StepCx::new(&tree, &frames, state.trace(), &state),
+        );
         if state.is_failed() {
             let (reason, view) = state.into_failure();
             return Err(FailedState::new(reason, view));
@@ -660,8 +669,8 @@ mod tests {
     struct Leaves(usize);
 
     impl Observer for Leaves {
-        fn observe(&mut self, state: &State) {
-            if state.is_terminal() {
+        fn step(&mut self, step: Step<'_>, cx: StepCx<'_, '_>) {
+            if matches!(step, Step::Visit) && cx.state().is_terminal() {
                 self.0 += 1;
             }
         }
@@ -713,9 +722,9 @@ mod tests {
     struct Classes(BTreeSet<Canon>);
 
     impl Observer for Classes {
-        fn observe(&mut self, state: &State) {
-            if state.is_terminal() {
-                self.0.insert(canon(state));
+        fn step(&mut self, step: Step<'_>, cx: StepCx<'_, '_>) {
+            if matches!(step, Step::Visit) && cx.state().is_terminal() {
+                self.0.insert(canon(cx.state()));
             }
         }
     }

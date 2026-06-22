@@ -4,7 +4,7 @@
 //! trace-counting boilerplate lives in one place instead of being copied per
 //! example.
 
-use interweave::{Observer, State, World, explore};
+use interweave::{Observer, Step, StepCx, World, explore};
 
 /// Tally of an exploration: maximal traces (leaves) and total visited states.
 #[derive(Default)]
@@ -14,10 +14,12 @@ pub struct Counts {
 }
 
 impl Observer for Counts {
-    fn observe(&mut self, state: &State) {
-        self.states += 1;
-        if state.is_terminal() {
-            self.traces += 1;
+    fn step(&mut self, step: Step<'_>, cx: StepCx<'_, '_>) {
+        if let Step::Visit = step {
+            self.states += 1;
+            if cx.state().is_terminal() {
+                self.traces += 1;
+            }
         }
     }
 }

@@ -18,7 +18,7 @@ use std::future::poll_fn;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
-use interweave::{Object, ObjectID, Observer, State, Transition, World, explore};
+use interweave::{Object, ObjectID, Observer, Step, StepCx, Transition, World, explore};
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -178,8 +178,8 @@ fn program(world: &mut World) {
 struct Traces(usize);
 
 impl Observer for Traces {
-    fn observe(&mut self, state: &State) {
-        if state.is_terminal() {
+    fn step(&mut self, step: Step<'_>, cx: StepCx<'_, '_>) {
+        if matches!(step, Step::Visit) && cx.state().is_terminal() {
             self.0 += 1;
         }
     }
