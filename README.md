@@ -73,43 +73,6 @@ Writing the value *before* raising the flag fixes it, and the checker then
 clears every interleaving — that is the other half of its job, a proof rather
 than the absence of a failing test run.
 
-Runnable examples live in [`examples/`](examples):
-
-- `publish` — the program above, with the failing schedule printed out.
-- `bank` — two accounts and a non-atomic transfer; the auditor catches the money
-  mid-transfer.
-- `custom_object` — define your own synchronization primitive by implementing
-  `Object` and registering it with `World::register`.
-- `rpc_mux` — an RPC connection multiplexer that routes replies by a shared
-  in-flight slot instead of the id in each frame, so under a race a reply is
-  delivered to the wrong call.
-- `readers` / `lastzero` / `indexer` — reproduce the POPL'14 Optimal-DPOR
-  benchmark counts (one maximal trace per Mazurkiewicz class).
-
-## Layout
-
-Three module layers, dependencies pointing downward (`search → model`, with
-`model ↔ sync` a mutual pair):
-
-- `model/` — the modeled system and its execution: the deterministic `executor`,
-  the `Object` trait + `Transition`, processes, and the `World` / `State` /
-  `StateView` the search walks. Transparent to the layer above.
-- `sync/` — synchronization primitives (`Atomic` and an unbounded MPSC channel:
-  `Sender` / `Receiver`) whose every observable operation is a `.await` yield point.
-- `search/` — the exploration algorithm (Optimal DPOR via `explore`) and the
-  `Observer` hook it calls at every state.
-
-## Status
-
-- [x] Deterministic executor (futures + per-process wakers + FIFO driver)
-- [x] `Atomic` primitive with load / store / compare-exchange as yield points
-- [x] Custom primitives via the `Object` trait + `World::register` extension point
-- [x] Optimal DPOR (Abdulla et al., POPL'14) — wakeup trees + sleep sets and
-      vector-clock happens-before; one trace per Mazurkiewicz class, no
-      sleep-set blocking
-- [ ] Channels (blocking, unbounded MPSC)
-- [ ] Visualization of the interleaving tree / happens-before graphs
-
 ## References
 
 - Abdulla et al., *Optimal Dynamic Partial Order Reduction* (POPL'14)
