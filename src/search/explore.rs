@@ -6,9 +6,11 @@ use crate::model::{FailureReason, State, StateView, World};
 /// Enumerates interleavings of the program built by `setup` under Optimal DPOR.
 ///
 /// `setup` builds the program once into a fresh [`World`](crate::model::World) (spawning
-/// processes, declaring atomics); it is re-run on every replay, so it must be deterministic.
-/// `observer` is notified at every explored state — runnable, terminal, or failed; pass
-/// `&mut ()` to observe nothing.
+/// processes, creating the shared objects); it is run repeatedly to explore different
+/// schedules, so it must be deterministic.
+/// `observer`'s [`step`](Observer::step) is notified at each discrete decision, including a
+/// [`Step::Visit`](crate::Step::Visit) for every explored state — runnable, terminal, or failed;
+/// pass `&mut ()` to observe nothing.
 ///
 /// Returns `Ok(())` if every reachable interleaving terminates cleanly, or the first
 /// [`FailedState`] encountered (a process error or a deadlock), at which point the search stops.
@@ -50,8 +52,7 @@ impl<'a> FailedState<'a> {
     /// Replays the failing prefix from scratch, reproducing the same failure.
     ///
     /// Re-runs the `setup` closure and re-applies the recorded trace, yielding an equivalent
-    /// [`FailedState`]. This demonstrates that the discovered schedule is deterministically
-    /// reproducible.
+    /// [`FailedState`].
     pub fn play(&self) -> Self {
         Self::from_state(self.view.state())
     }
