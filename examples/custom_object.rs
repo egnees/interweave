@@ -18,7 +18,7 @@ use std::future::poll_fn;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
-use interweave::{Object, ObjectID, Observer, State, Strategy, Transition, World, explore};
+use interweave::{Object, ObjectID, Observer, State, Transition, World, explore};
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -187,7 +187,7 @@ impl Observer for Traces {
 
 fn main() {
     let mut traces = Traces::default();
-    explore(&program, &mut traces, Strategy::Optimal).expect("the counter never fails");
+    explore(&program, &mut traces).expect("the counter never fails");
     // With a single reader every pair conflicts (inc/inc and inc/get), so each of
     // the 3! orderings is its own Mazurkiewicz class: 6 maximal interleavings. A
     // second reader would commute with the first, collapsing some classes.

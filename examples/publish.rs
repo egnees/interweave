@@ -17,7 +17,7 @@
 //! cargo run --example publish
 //! ```
 
-use interweave::{Strategy, World, explore};
+use interweave::{World, explore};
 
 const VALUE: i32 = 42;
 const READY: i32 = 1;
@@ -45,7 +45,7 @@ fn publish(world: &mut World) {
 }
 
 fn main() {
-    match explore(&publish, &mut (), Strategy::Optimal) {
+    match explore(&publish, &mut ()) {
         Ok(()) => println!("no interleaving reads stale data (unexpected for this program)"),
         Err(failed) => {
             println!("found a schedule that reads the value before it was published:");

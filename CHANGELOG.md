@@ -18,8 +18,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   send→recv (a reads-from edge) is not redundantly explored.
 - Public `Object` trait and `World::register` extension point for defining custom
   synchronization primitives (the built-in `Atomic` is one such primitive).
-- `explore` entry point with two strategies: naive exhaustive `Strategy::Dfs` and
-  `Strategy::Optimal` (Optimal DPOR, Abdulla et al., POPL'14).
+- `explore` entry point running Optimal DPOR (Abdulla et al., POPL'14).
 - `Observer` hook called at every explored state (`&mut ()` to observe nothing).
 - Examples: `publish` and `bank` (the checker finding an unsafe-publication and a
   non-atomic transfer bug), `custom_object` (a from-scratch primitive via the

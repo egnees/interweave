@@ -4,26 +4,7 @@ use super::observer::Observer;
 use super::step::StepObserver;
 use crate::model::{FailureReason, State, StateView, World};
 
-/// The model-checking strategy [`explore`] runs.
-///
-/// Both strategies cover the same state space; they differ only in how much redundant work they
-/// do. [`Strategy::Optimal`] is the intended driver for non-trivial programs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Strategy {
-    /// Exhaustive depth-first search over every interleaving.
-    ///
-    /// Visits each distinct scheduling once, including interleavings that are equivalent under
-    /// happens-before. Simple and useful as a reference oracle, but its cost grows with the raw
-    /// number of schedules rather than the number of equivalence classes.
-    Dfs,
-    /// Optimal Dynamic Partial Order Reduction.
-    ///
-    /// Explores exactly one interleaving per Mazurkiewicz (happens-before) equivalence class and
-    /// never reaches a sleep-set-blocked state (Abdulla et al., POPL'14).
-    Optimal,
-}
-
-/// Enumerates interleavings of the program built by `setup` under the chosen [`Strategy`].
+/// Enumerates interleavings of the program built by `setup` under Optimal DPOR.
 ///
 /// `setup` builds the program once into a fresh [`World`](crate::model::World) (spawning
 /// processes, declaring atomics); it is re-run on every replay, so it must be deterministic.
@@ -35,16 +16,12 @@ pub enum Strategy {
 pub fn explore<'a>(
     setup: &'a dyn Fn(&mut World<'a>),
     observer: &mut impl Observer,
-    strategy: Strategy,
 ) -> Result<(), FailedState<'a>> {
     let root = StateView::new(setup).state();
-    match strategy {
-        Strategy::Dfs => dfs(root, observer),
-        Strategy::Optimal => super::optimal::run(root, observer, &mut ()),
-    }
+    super::optimal::run(root, observer, &mut ())
 }
 
-/// Like [`explore`] under [`Strategy::Optimal`], but with a [`StepObserver`] wired
+/// Like [`explore`] (Optimal DPOR), but with a [`StepObserver`] wired
 /// into the driver so a consumer can watch the algorithm's discrete decisions
 /// (descend, seed, race-reversal, pop, …) as they happen. The state-level
 /// [`Observer`](super::Observer) is the no-op `()`; this entry point exists for the
@@ -61,22 +38,6 @@ pub fn explore_stepped<'a>(
 ) -> Result<(), FailedState<'a>> {
     let root = StateView::new(setup).state();
     super::optimal::run(root, &mut (), steps)
-}
-
-// The observer sees every state first — failed ones included — so it can read the failure reason
-// and resolve the failing transition before a failed branch aborts the search.
-fn dfs<'a>(state: State<'a>, observer: &mut impl Observer) -> Result<(), FailedState<'a>> {
-    observer.observe(&state);
-    if state.is_failed() {
-        return Err(FailedState::from_state(state));
-    }
-    // An empty `enabled` with no failure is a clean terminal: every process is done.
-    for t in state.enabled() {
-        let mut next = state.fork();
-        next.apply(t);
-        dfs(next, observer)?;
-    }
-    Ok(())
 }
 
 /// A reproducible failure returned by [`explore`].
@@ -139,7 +100,7 @@ impl StdError for FailedState<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Strategy, explore};
+    use super::explore;
     use crate::model::World;
 
     // A writer racing a reader on one atomic: the reader errors unless the store commits first, so
@@ -162,7 +123,7 @@ mod tests {
 
     #[test]
     fn play_reproduces_failure() {
-        let failed = explore(&racy, &mut (), Strategy::Dfs).unwrap_err();
+        let failed = explore(&racy, &mut ()).unwrap_err();
         let again = failed.play();
         assert_eq!(failed.to_string(), again.to_string());
     }
@@ -185,7 +146,7 @@ mod tests {
 
     #[test]
     fn explores_clean_program() {
-        assert!(explore(&two_writers, &mut (), Strategy::Dfs).is_ok());
+        assert!(explore(&two_writers, &mut ()).is_ok());
     }
 
     // A lone process blocked forever: nothing is enabled yet it never completes, which the search
@@ -199,7 +160,7 @@ mod tests {
 
     #[test]
     fn deadlock_is_detected() {
-        let failed = explore(&never_finishes, &mut (), Strategy::Dfs).unwrap_err();
+        let failed = explore(&never_finishes, &mut ()).unwrap_err();
         assert_eq!(failed.to_string(), "deadlock");
         failed.play();
     }

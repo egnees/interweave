@@ -4,7 +4,7 @@
 //! trace-counting boilerplate lives in one place instead of being copied per
 //! example.
 
-use interweave::{Observer, State, Strategy, World, explore};
+use interweave::{Observer, State, World, explore};
 
 /// Tally of an exploration: maximal traces (leaves) and total visited states.
 #[derive(Default)]
@@ -34,7 +34,7 @@ pub fn size(default: usize) -> usize {
 /// These benchmarks never fail, so a failure is surfaced but not propagated.
 pub fn explore_counts<F: Fn(&mut World)>(program: F) -> Counts {
     let mut counts = Counts::default();
-    if let Err(failed) = explore(&program, &mut counts, Strategy::Optimal) {
+    if let Err(failed) = explore(&program, &mut counts) {
         eprintln!("unexpected failure: {failed}");
     }
     counts

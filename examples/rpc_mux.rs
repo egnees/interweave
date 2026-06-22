@@ -18,7 +18,7 @@
 //! cargo run --example rpc_mux
 //! ```
 
-use interweave::{Strategy, World, explore};
+use interweave::{World, explore};
 
 // A reply frame on the shared connection: the request id it answers and the result
 // destined for that request's caller (call k's result is k * 10).
@@ -68,7 +68,7 @@ fn rpc_mux(world: &mut World) {
 }
 
 fn main() {
-    match explore(&rpc_mux, &mut (), Strategy::Optimal) {
+    match explore(&rpc_mux, &mut ()) {
         Ok(()) => println!("every reply reaches its caller (unexpected for this program)"),
         Err(failed) => {
             println!("found a schedule where a reply is misrouted:");

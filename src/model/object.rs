@@ -12,8 +12,7 @@ use super::{pid, process};
 pub type ObjectID = usize;
 
 /// One schedulable step: a process performing one observable operation on one
-/// synchronization object — the unit a [`Strategy`](crate::Strategy) picks at each
-/// scheduling point.
+/// synchronization object — the unit the search picks at each scheduling point.
 ///
 /// It carries the operating process, the target object, and a per-object `seq`
 /// that tells the object's several concurrent operations apart — unique per

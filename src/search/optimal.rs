@@ -581,10 +581,33 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt::Debug;
 
-    use super::{State, event_clocks, happens_before};
+    use super::{State, StateView, event_clocks, happens_before};
     use crate::Atomic;
     use crate::model::World;
-    use crate::search::{Observer, Strategy, explore};
+    use crate::search::{FailedState, Observer, explore};
+
+    // Exhaustive DFS over every interleaving — the ground-truth oracle Optimal is
+    // checked against. Mirrors the old public driver, kept test-only.
+    fn dfs<'a>(state: State<'a>, observer: &mut impl Observer) -> Result<(), FailedState<'a>> {
+        observer.observe(&state);
+        if state.is_failed() {
+            let (reason, view) = state.into_failure();
+            return Err(FailedState::new(reason, view));
+        }
+        for t in state.enabled() {
+            let mut next = state.fork();
+            next.apply(t);
+            dfs(next, observer)?;
+        }
+        Ok(())
+    }
+
+    fn dfs_explore<'a>(
+        setup: &'a dyn Fn(&mut World<'a>),
+        observer: &mut impl Observer,
+    ) -> Result<(), FailedState<'a>> {
+        dfs(StateView::new(setup).state(), observer)
+    }
 
     // --- spawn helpers ----------------------------------------------------------
     // Each fixture is a fixed set of processes, each a short sequence of atomic ops
@@ -646,9 +669,15 @@ mod tests {
         }
     }
 
-    fn leaves<'a>(setup: &'a dyn Fn(&mut World<'a>), strategy: Strategy) -> usize {
+    fn leaves<'a>(setup: &'a dyn Fn(&mut World<'a>)) -> usize {
         let mut obs = Leaves::default();
-        let _ = explore(setup, &mut obs, strategy);
+        let _ = explore(setup, &mut obs);
+        obs.0
+    }
+
+    fn dfs_leaves<'a>(setup: &'a dyn Fn(&mut World<'a>)) -> usize {
+        let mut obs = Leaves::default();
+        let _ = dfs_explore(setup, &mut obs);
         obs.0
     }
 
@@ -695,32 +724,28 @@ mod tests {
 
     fn classes<'a>(setup: &'a dyn Fn(&mut World<'a>)) -> usize {
         let mut obs = Classes::default();
-        let _ = explore(setup, &mut obs, Strategy::Dfs);
+        let _ = dfs_explore(setup, &mut obs);
         obs.0.len()
     }
 
     // Optimal explores exactly one trace per class, and never more than DFS.
     fn assert_optimal<'a>(setup: &'a dyn Fn(&mut World<'a>)) {
-        let opt = leaves(setup, Strategy::Optimal);
+        let opt = leaves(setup);
         assert_eq!(
             opt,
             classes(setup),
             "Optimal must explore one trace per class"
         );
         assert!(
-            opt <= leaves(setup, Strategy::Dfs),
+            opt <= dfs_leaves(setup),
             "Optimal must never explore more than DFS"
         );
     }
 
     // DFS sees `dfs` leaves, Optimal sees `optimal`, and Optimal is one-per-class.
     fn assert_leaves<'a>(setup: &'a dyn Fn(&mut World<'a>), dfs: usize, optimal: usize) {
-        assert_eq!(leaves(setup, Strategy::Dfs), dfs, "DFS leaf count");
-        assert_eq!(
-            leaves(setup, Strategy::Optimal),
-            optimal,
-            "Optimal leaf count"
-        );
+        assert_eq!(dfs_leaves(setup), dfs, "DFS leaf count");
+        assert_eq!(leaves(setup), optimal, "Optimal leaf count");
         assert_optimal(setup);
     }
 
@@ -1114,7 +1139,7 @@ mod tests {
 
     #[test]
     fn reduces_writer_two_readers() {
-        assert!(leaves(&one_writer_two_readers, Strategy::Optimal) < 6);
+        assert!(leaves(&one_writer_two_readers) < 6);
         assert_optimal(&one_writer_two_readers);
     }
 
@@ -1130,14 +1155,14 @@ mod tests {
     #[test]
     fn finds_the_race() {
         // Optimal still reaches the stale-read failure DFS finds, identically.
-        let dfs = explore(&racy, &mut (), Strategy::Dfs).unwrap_err();
-        let opt = explore(&racy, &mut (), Strategy::Optimal).unwrap_err();
+        let dfs = dfs_explore(&racy, &mut ()).unwrap_err();
+        let opt = explore(&racy, &mut ()).unwrap_err();
         assert_eq!(opt.to_string(), dfs.to_string());
     }
 
     #[test]
     fn detects_deadlock() {
-        let failed = explore(&never_finishes, &mut (), Strategy::Optimal).unwrap_err();
+        let failed = explore(&never_finishes, &mut ()).unwrap_err();
         assert_eq!(failed.to_string(), "deadlock");
     }
 
@@ -1154,8 +1179,8 @@ mod tests {
     fn rpc_mux_bug_found_identically() {
         // Differential soundness: DFS and Optimal both find the reply-misrouting bug
         // and report the same failing state.
-        let dfs = explore(&rpc_mux, &mut (), Strategy::Dfs).unwrap_err();
-        let opt = explore(&rpc_mux, &mut (), Strategy::Optimal).unwrap_err();
+        let dfs = dfs_explore(&rpc_mux, &mut ()).unwrap_err();
+        let opt = explore(&rpc_mux, &mut ()).unwrap_err();
         assert_eq!(opt.to_string(), dfs.to_string());
     }
 
@@ -1203,14 +1228,14 @@ mod tests {
         for n in 2..=4 {
             assert_optimal(&|w| readers(w, n));
         }
-        assert_eq!(leaves(&|w| readers(w, 2), Strategy::Optimal), 4);
+        assert_eq!(leaves(&|w| readers(w, 2)), 4);
     }
 
     #[test]
     fn readers_paper_counts() {
         // 2^N classes.
-        assert_eq!(leaves(&|w| readers(w, 8), Strategy::Optimal), 256);
-        assert_eq!(leaves(&|w| readers(w, 13), Strategy::Optimal), 8192);
+        assert_eq!(leaves(&|w| readers(w, 8)), 256);
+        assert_eq!(leaves(&|w| readers(w, 13)), 8192);
     }
 
     #[test]
@@ -1230,15 +1255,15 @@ mod tests {
     #[test]
     fn lastzero_paper_counts() {
         // (N+3)·2^(N-2) classes.
-        assert_eq!(leaves(&|w| lastzero(w, 5), Strategy::Optimal), 64);
-        assert_eq!(leaves(&|w| lastzero(w, 10), Strategy::Optimal), 3328);
+        assert_eq!(leaves(&|w| lastzero(w, 5)), 64);
+        assert_eq!(leaves(&|w| lastzero(w, 10)), 3328);
     }
 
     // ~300M apply-ops: run with `cargo test -- --ignored --release`.
     #[test]
     #[ignore]
     fn lastzero_15_paper_count() {
-        assert_eq!(leaves(&|w| lastzero(w, 15), Strategy::Optimal), 147456);
+        assert_eq!(leaves(&|w| lastzero(w, 15)), 147456);
     }
 
     // The CAS-collision logic indexer relies on, checked against ground truth.
@@ -1250,13 +1275,13 @@ mod tests {
 
     #[test]
     fn indexer_paper_counts() {
-        assert_eq!(leaves(&|w| indexer(w, 12), Strategy::Optimal), 8);
+        assert_eq!(leaves(&|w| indexer(w, 12)), 8);
     }
 
     // ~21M apply-ops: run with `cargo test -- --ignored --release`.
     #[test]
     #[ignore]
     fn indexer_15_paper_count() {
-        assert_eq!(leaves(&|w| indexer(w, 15), Strategy::Optimal), 4096);
+        assert_eq!(leaves(&|w| indexer(w, 15)), 4096);
     }
 }

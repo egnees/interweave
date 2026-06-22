@@ -13,8 +13,7 @@
 //! That strategy is [**Optimal DPOR**](https://doi.org/10.1145/2535838.2535845)
 //! (Abdulla et al., POPL'14): it explores exactly one interleaving per
 //! Mazurkiewicz equivalence class, with no redundant work and no sleep-set
-//! blocking. A naive exhaustive [`Strategy::Dfs`] is also available for
-//! cross-checking.
+//! blocking.
 //!
 //! [`Future`]: std::future::Future
 //!
@@ -27,7 +26,7 @@
 //! double-checked locking:
 //!
 //! ```
-//! use interweave::{Strategy, World, explore};
+//! use interweave::{World, explore};
 //!
 //! fn publish(world: &mut World) {
 //!     let data = world.atomic("data", 0);
@@ -55,7 +54,7 @@
 //!
 //! // `()` is the no-op observer; Optimal DPOR finds the schedule where the
 //! // consumer sees `ready == 1` but still reads the stale `data`.
-//! explore(&publish, &mut (), Strategy::Optimal).expect_err("publishes the flag before the value");
+//! explore(&publish, &mut ()).expect_err("publishes the flag before the value");
 //! ```
 //!
 //! # Architecture
@@ -68,8 +67,8 @@
 //!   / [`FailureReason`] verdicts.
 //! - **`sync`** — synchronization primitives whose every observable operation is an `.await` yield
 //!   point: [`Atomic`] and an unbounded MPSC channel ([`Sender`] / [`Receiver`]).
-//! - **`search`** — the exploration algorithms: [`explore`] dispatches on a [`Strategy`], reports
-//!   the first [`FailedState`], and calls an [`Observer`] at every visited state.
+//! - **`search`** — the exploration algorithm: [`explore`] runs Optimal DPOR, reports the first
+//!   [`FailedState`], and calls an [`Observer`] at every visited state.
 //!
 //! # Custom synchronization objects
 //!
@@ -87,7 +86,7 @@ pub use model::{
     FailureReason, Object, ObjectID, ProcessError, ProcessID, ProcessResult, State, Transition,
     World,
 };
-pub use search::{FailedState, Observer, Strategy, explore};
+pub use search::{FailedState, Observer, explore};
 pub use sync::{Atomic, Receiver, Sender};
 
 // The step-instrumentation hook for Optimal DPOR: the only public surface the `viz`

@@ -305,7 +305,9 @@ impl<'a> State<'a> {
         }
     }
 
-    // An independent copy, rebuilt by replaying its view from scratch.
+    // An independent copy, rebuilt by replaying its view from scratch. Only the
+    // test-only exhaustive-DFS oracle needs it; Optimal replays views directly.
+    #[cfg(test)]
     pub(crate) fn fork(&self) -> Self {
         self.view().state()
     }

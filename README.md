@@ -30,7 +30,7 @@ schedule where the consumer sees the flag set yet reads the stale value, the
 unsafe-publication race behind broken double-checked locking:
 
 ```rust
-use interweave::{Strategy, World, explore};
+use interweave::{World, explore};
 
 fn publish(world: &mut World) {
     let data = world.atomic("data", 0);
@@ -58,7 +58,7 @@ fn publish(world: &mut World) {
 
 // Optimal DPOR finds the schedule where the consumer sees `ready == 1` but
 // still reads the stale `data`.
-explore(&publish, &mut (), Strategy::Optimal).expect_err("publishes the flag before the value");
+explore(&publish, &mut ()).expect_err("publishes the flag before the value");
 ```
 
 Writing the value *before* raising the flag fixes it, and the checker then
@@ -88,15 +88,14 @@ Three module layers, dependencies pointing downward (`search → model`, with
   `StateView` the search walks. Transparent to the layer above.
 - `sync/` — synchronization primitives (`Atomic` and an unbounded MPSC channel:
   `Sender` / `Receiver`) whose every observable operation is a `.await` yield point.
-- `search/` — the exploration algorithms (naive DFS and Optimal DPOR; `explore`
-  takes the `Strategy`) and the `Observer` hook they call at every state.
+- `search/` — the exploration algorithm (Optimal DPOR via `explore`) and the
+  `Observer` hook it calls at every state.
 
 ## Status
 
 - [x] Deterministic executor (futures + per-process wakers + FIFO driver)
 - [x] `Atomic` primitive with load / store / compare-exchange as yield points
 - [x] Custom primitives via the `Object` trait + `World::register` extension point
-- [x] Naive exhaustive DFS over interleavings (`explore`)
 - [x] Optimal DPOR (Abdulla et al., POPL'14) — wakeup trees + sleep sets and
       vector-clock happens-before; one trace per Mazurkiewicz class, no
       sleep-set blocking

@@ -19,7 +19,7 @@
 //! cargo run --example bank
 //! ```
 
-use interweave::{Strategy, World, explore};
+use interweave::{World, explore};
 
 const TOTAL: i32 = 100;
 
@@ -52,7 +52,7 @@ fn bank(world: &mut World) {
 }
 
 fn main() {
-    match explore(&bank, &mut (), Strategy::Optimal) {
+    match explore(&bank, &mut ()) {
         Ok(()) => println!("no interleaving violates the invariant (unexpected for this program)"),
         Err(failed) => {
             println!("found a schedule that breaks the a + b == {TOTAL} invariant:");
