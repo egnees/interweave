@@ -22,6 +22,12 @@ The exploration strategy is **Optimal DPOR** (Abdulla et al., POPL'14): it
 visits exactly one interleaving per equivalence class, so the search stays
 exhaustive without the combinatorial blow-up of enumerating every ordering.
 
+## Install
+
+```sh
+cargo add interweave
+```
+
 ## Usage
 
 Write a concurrent program against `World`, then `explore` every
