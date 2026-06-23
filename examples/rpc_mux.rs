@@ -34,7 +34,8 @@ fn rpc_mux(world: &mut World) {
     let (conn, reader) = world.channel::<Reply>("conn");
 
     // Two callers share the one connection. Each marks its call in-flight, then sends
-    // its request; the server echoes a reply frame back tagged with the same id.
+    // the reply frame for its own call — the round-trip is collapsed, there is no
+    // separate server task in this minimal model.
     for id in 0..2 {
         let (in_flight, conn) = (in_flight.clone(), conn.clone());
         world.spawn(format!("caller-{id}"), async move {
@@ -73,7 +74,6 @@ fn main() {
         Err(failed) => {
             println!("found a schedule where a reply is misrouted:");
             println!("  {failed}");
-            println!("  {failed:?}");
         }
     }
 }
