@@ -5,7 +5,7 @@ use crate::model::{FailureReason, State, StateView, World};
 
 /// Enumerates interleavings of the program built by `setup` under Optimal DPOR.
 ///
-/// `setup` builds the program once into a fresh [`World`](crate::model::World) (spawning
+/// `setup` builds the program once into a fresh [`World`](crate::World) (spawning
 /// processes, creating the shared objects); it is run repeatedly to explore different
 /// schedules, so it must be deterministic.
 /// `observer`'s [`step`](Observer::step) is notified at each discrete decision, including a
@@ -28,6 +28,13 @@ pub fn explore<'a>(
 /// offending schedule can be reproduced deterministically with [`play`](FailedState::play).
 /// Implements [`std::error::Error`], [`std::fmt::Display`] (the reason) and a `Debug` that also
 /// shows the failing trace.
+///
+/// It borrows the `setup` closure for replay, so it is neither `Send` nor `Sync` (nor, when the
+/// closure captures borrowed locals, `'static`): it cannot be `?`-propagated into a boxed
+/// `'static` error such as `anyhow::Error` or a `Box<dyn Error + Send + Sync>` test return.
+/// Inspect it in place — [`reason`](FailedState::reason), its [`Display`](std::fmt::Display), or
+/// [`play`](FailedState::play) — or copy out what you need (e.g. the `Display` string) before the
+/// `setup` scope ends.
 pub struct FailedState<'a> {
     reason: FailureReason,
     view: StateView<'a>,
