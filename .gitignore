@@ -6,8 +6,3 @@
 
 # macOS Finder metadata.
 .DS_Store
-
-# Scratch report artifacts. The golden report is web/public/report.json; these
-# root-level dumps are throwaway and must not be tracked.
-/report.json
-/2atomics.json

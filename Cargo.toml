@@ -11,8 +11,8 @@ readme = "README.md"
 license = "MIT"
 keywords = ["dpor", "model-checking", "concurrency", "interleaving", "stateless"]
 categories = ["concurrency", "simulation", "development-tools::testing"]
-authors = ["Sergei Yakovlev <3gnees@gmail.com>"]
-exclude = ["/web", "/refs", "/.claude", "/.github", "/unweave"]
+authors = ["Sergey Yakovlev <3gnees@gmail.com>"]
+exclude = ["/.github", "/.claude"]
 
 [dependencies]
 thiserror = "2"
