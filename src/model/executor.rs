@@ -172,7 +172,7 @@ pub(crate) fn pid() -> ProcessID {
 #[derive(Debug)]
 pub(crate) struct RawProcessError {
     pub(crate) pid: ProcessID,
-    pub(crate) source: Box<dyn Error>,
+    pub(crate) source: Box<dyn Error + Send + Sync>,
 }
 
 #[cfg(test)]

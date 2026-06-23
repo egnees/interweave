@@ -263,6 +263,20 @@ impl<T> Clone for Sender<T> {
     }
 }
 
+impl<T> std::fmt::Debug for Sender<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `try_borrow` so printing a handle never panics, even from inside an `apply`
+        // that formats a self-referential message holding this sender.
+        match self.chan.try_borrow() {
+            Ok(c) => f
+                .debug_struct("Sender")
+                .field("channel", &c.id)
+                .finish_non_exhaustive(),
+            Err(_) => f.debug_struct("Sender").finish_non_exhaustive(),
+        }
+    }
+}
+
 impl<T: Debug> Sender<T> {
     /// Enqueues `value` at the back of the channel.
     ///
@@ -305,6 +319,18 @@ impl<T: Debug> Sender<T> {
 /// blocking while the channel is empty.
 pub struct Receiver<T> {
     chan: Rc<RefCell<Channel<T>>>,
+}
+
+impl<T> std::fmt::Debug for Receiver<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.chan.try_borrow() {
+            Ok(c) => f
+                .debug_struct("Receiver")
+                .field("channel", &c.id)
+                .finish_non_exhaustive(),
+            Err(_) => f.debug_struct("Receiver").finish_non_exhaustive(),
+        }
+    }
 }
 
 impl<T: Debug> Receiver<T> {

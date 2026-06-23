@@ -8,7 +8,10 @@ mod executor;
 mod object;
 mod process;
 
-use std::{error::Error, fmt::Debug};
+use std::{
+    error::Error,
+    fmt::{self, Debug},
+};
 
 pub use object::{Object, ObjectID, Transition};
 pub use process::{ProcessID, ProcessResult};
@@ -136,12 +139,21 @@ impl<'a> World<'a> {
     }
 }
 
+impl Debug for World<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("World")
+            .field("processes", &self.process_names)
+            .field("objects", &self.object_names)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The error reported when a process future returns `Err`, naming the process.
 #[derive(Debug, thiserror::Error)]
 #[error("process {process} failed: {source}")]
 pub struct ProcessError {
     process: String,
-    source: Box<dyn Error>,
+    source: Box<dyn Error + Send + Sync>,
 }
 
 impl ProcessError {
@@ -154,6 +166,7 @@ impl ProcessError {
 /// Why a [`State`] makes no further progress, as reported by
 /// [`State::failure_reason`] and carried by a [`FailedState`](crate::FailedState).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FailureReason {
     /// A process future returned an error.
     #[error("{0}")]
@@ -173,6 +186,15 @@ pub struct State<'a> {
     setup: &'a dyn Fn(&mut World<'a>),
     trace: Vec<Transition>,
     failure: Option<FailureReason>,
+}
+
+impl Debug for State<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("State")
+            .field("trace", &self.trace)
+            .field("failure", &self.failure)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]

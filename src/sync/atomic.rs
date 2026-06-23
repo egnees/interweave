@@ -148,7 +148,7 @@ impl<T: Copy + PartialEq + Debug> Atomic<T> {
 /// A cloneable handle to a shared atomic cell.
 ///
 /// Clones share the same underlying cell, so handing a clone to each process gives them a common
-/// atomic to operate on. Re-exported from the crate root as [`Atomic`](crate::Atomic).
+/// atomic to operate on. This is the type the crate root exports as `Atomic`.
 ///
 /// Every operation ([`store`](Handle::store), [`load`](Handle::load),
 /// [`compare_exchange`](Handle::compare_exchange)) is an `async` method: awaiting it registers the
@@ -235,6 +235,19 @@ impl<T: Copy + PartialEq + Debug + 'static> Object for Handle<T> {
 
     fn depends(&self, t1: Transition, t2: Transition) -> bool {
         self.atomic.borrow().depends(t1, t2)
+    }
+}
+
+impl<T: Copy + PartialEq + Debug> std::fmt::Debug for Handle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `try_borrow` so printing a handle never panics, even mid-mutation.
+        match self.atomic.try_borrow() {
+            Ok(a) => f
+                .debug_struct("Atomic")
+                .field("id", &a.id)
+                .finish_non_exhaustive(),
+            Err(_) => f.debug_struct("Atomic").finish_non_exhaustive(),
+        }
     }
 }
 

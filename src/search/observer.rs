@@ -12,6 +12,8 @@
 //! crate — a pure consumer of [`Observer::step`] plus the public `model` surface, the
 //! same way any external consumer would.
 
+use std::fmt;
+
 use super::optimal::{Frame, Wut};
 use crate::model::{ObjectID, ProcessID, State, Transition};
 
@@ -125,6 +127,15 @@ impl<'a, 'w> StepCx<'a, 'w> {
     }
 }
 
+impl fmt::Debug for StepCx<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StepCx")
+            .field("depth", &self.depth())
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A read-only view of one wakeup-tree node. Children are in ≺ (sibling) order;
 /// `children()[0]` is the ≺-minimal branch, explored first — walk it to inspect the
 /// reversing fragments the search still plans to run from the current frontier.
@@ -144,10 +155,19 @@ impl<'a> WakeupNode<'a> {
     }
 }
 
+impl fmt::Debug for WakeupNode<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.node.children().iter().map(|(edge, _)| edge.pid()))
+            .finish()
+    }
+}
+
 /// How the reordering of a reversible race ([`Step::Race`]'s `v`) resolved against the
 /// wakeup tree. `insert_depth`, where present, is the depth the fragment targets — the
 /// point just before the earlier racing event.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum RaceOutcome {
     /// Rejected: running `ep`'s process first would leave it unable to perform `ep`
     /// (for example a `recv` whose only matching `send` is `e`), so the reordered
@@ -156,13 +176,21 @@ pub enum RaceOutcome {
     /// Already covered: a process asleep at the target prefix is a weak-initial of the
     /// fragment, so the reversed order is reached without adding anything.
     CoveredBySleeper {
+        /// The depth the fragment targets (just before the earlier racing event).
         insert_depth: usize,
+        /// The sleeping process that already covers the reversal.
         covering_pid: ProcessID,
     },
     /// Already covered by an existing branch of the wakeup tree.
-    ExistingLeaf { insert_depth: usize },
+    ExistingLeaf {
+        /// The depth the fragment targets (just before the earlier racing event).
+        insert_depth: usize,
+    },
     /// A fresh branch was grafted into the wakeup tree to explore the reversed order.
-    Grafted { insert_depth: usize },
+    Grafted {
+        /// The depth the fresh branch was grafted at (just before the earlier racing event).
+        insert_depth: usize,
+    },
 }
 
 // Borrows the driver's live data, so emitting a step allocates nothing and the
@@ -177,6 +205,8 @@ pub enum RaceOutcome {
 /// [`StepCx`]. Transitions in planned or sleeping data identify their process
 /// ([`Transition::pid`]) and object ([`Transition::oid`]) but not a stable operation,
 /// so do not [`label`](StepCx::label) them.
+#[derive(Debug)]
+#[non_exhaustive]
 pub enum Step<'a> {
     /// The search reached a state — the starting state, or one freshly advanced by a
     /// committed transition (so [`state()`](StepCx::state)'s [`trace`](State::trace)
@@ -189,7 +219,10 @@ pub enum Step<'a> {
 
     /// Exploration began: the search seeded its first interleaving with one enabled
     /// process, `seeded`.
-    RootSeed { seeded: Transition },
+    RootSeed {
+        /// The enabled process the first interleaving was seeded with.
+        seeded: Transition,
+    },
 
     /// Nothing to explore: no process is enabled at the start.
     RootEmpty,
@@ -199,7 +232,10 @@ pub enum Step<'a> {
     /// transitions (each labellable via [`StepCx::label`]); `failure` is `true` when
     /// the leaf ends in a process error or a deadlock.
     Maximal {
+        /// The interleaving's full sequence of committed transitions (each labellable
+        /// via [`StepCx::label`]).
         trace: &'a [Transition],
+        /// `true` when the leaf ends in a process error or a deadlock.
         failure: bool,
     },
 
@@ -209,9 +245,14 @@ pub enum Step<'a> {
     /// it: a process in `parent_sleep` but not `child_sleep` was woken because it
     /// conflicts with `committed`.
     Descend {
+        /// The prefix length before this step.
         depth: usize,
+        /// The transition committed as the interleaving's next step.
         committed: Transition,
+        /// The sleep set just before the step.
         parent_sleep: &'a [ProcessID],
+        /// The sleep set just after it; a pid in `parent_sleep` but not here was woken
+        /// because it conflicts with `committed`.
         child_sleep: &'a [ProcessID],
     },
 
@@ -220,7 +261,9 @@ pub enum Step<'a> {
     /// seeded one, or a continuation an earlier race reversal already planted there;
     /// `None` only when nothing is runnable (a maximal or fully-blocked state).
     SeedChild {
+        /// The depth of the child state just descended to.
         depth: usize,
+        /// The process now heading the child, or `None` when nothing is runnable.
         seeded: Option<Transition>,
     },
 
@@ -232,12 +275,20 @@ pub enum Step<'a> {
     /// `e` that do not happen-after `e` (the part of the future causally independent of
     /// `e`). `outcome` records how `v` resolved against the wakeup tree.
     Race {
+        /// 1-based trace position of the earlier racing event `e`.
         i: usize,
+        /// 1-based trace position of the later racing event `ep` (`i < j`).
         j: usize,
+        /// The earlier racing event.
         e: Transition,
+        /// The later racing event, which the reversal tries to bring before `e`.
         ep: Transition,
+        /// The events after `e` causally independent of it — the part of the future
+        /// kept when reversing.
         notdep: &'a [Transition],
+        /// The reversing fragment scheduled from just before `e`: `notdep` then `ep`.
         v: &'a [Transition],
+        /// How `v` resolved against the wakeup tree.
         outcome: RaceOutcome,
     },
 
@@ -245,14 +296,20 @@ pub enum Step<'a> {
     /// continuation at depth `from_depth` is done, and the search returns to
     /// `into_depth` (`= from_depth - 1`), putting `finished_pid` to sleep there.
     Pop {
+        /// The fully-explored process put to sleep at the parent.
         finished_pid: ProcessID,
+        /// The depth backtracked from.
         from_depth: usize,
+        /// The depth returned to (`from_depth - 1`).
         into_depth: usize,
     },
 
     /// The current state was rebuilt by replaying `prefix` from the start before the
     /// search continues down a different branch.
-    Replay { prefix: &'a [Transition] },
+    Replay {
+        /// The committed prefix replayed from the start to rebuild the current state.
+        prefix: &'a [Transition],
+    },
 
     /// Exploration is complete: one interleaving per Mazurkiewicz class has been
     /// visited.
