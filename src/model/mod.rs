@@ -86,18 +86,18 @@ impl<'a> World<'a> {
     }
 
     /// The name of the process that performs the given [`Transition`].
-    pub fn process(&self, t: &Transition) -> &str {
+    pub fn process(&self, t: Transition) -> &str {
         &self.process_names[t.pid]
     }
 
     /// The name of the object the given [`Transition`] operates on.
-    pub fn object(&self, t: &Transition) -> &str {
+    pub fn object(&self, t: Transition) -> &str {
         &self.object_names[t.oid]
     }
 
     /// A human-readable label for a *committed* [`Transition`] (e.g. `"load -> 123"`).
     /// Panics on a transition that has not committed.
-    pub fn label(&self, t: &Transition) -> String {
+    pub fn label(&self, t: Transition) -> String {
         self.objects[t.oid].label(t)
     }
 
@@ -376,6 +376,6 @@ mod tests {
             state.failure_reason(),
             Some(FailureReason::Process(_))
         ));
-        assert_eq!(state.world().label(&load), "load -> 123");
+        assert_eq!(state.world().label(load), "load -> 123");
     }
 }

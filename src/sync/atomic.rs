@@ -128,8 +128,8 @@ impl<T: Copy + PartialEq + Debug> Atomic<T> {
         !(self.op_of(t1).is_load() && self.op_of(t2).is_load())
     }
 
-    fn label(&self, t: &Transition) -> String {
-        let Some(rec) = self.history.iter().find(|r| r.transition == *t) else {
+    fn label(&self, t: Transition) -> String {
+        let Some(rec) = self.history.iter().find(|r| r.transition == t) else {
             panic!("label called on an unapplied transition");
         };
         match rec.op {
@@ -229,7 +229,7 @@ impl<T: Copy + PartialEq + Debug + 'static> Object for Handle<T> {
         self.atomic.borrow().enabled()
     }
 
-    fn label(&self, t: &Transition) -> String {
+    fn label(&self, t: Transition) -> String {
         self.atomic.borrow().label(t)
     }
 

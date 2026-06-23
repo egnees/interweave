@@ -120,7 +120,7 @@ pub trait Object {
     /// A human-readable label for an already-[`apply`](Object::apply)ied
     /// transition, e.g. `"load -> 123"`. Only ever called after the commit, so it
     /// may rely on recorded history.
-    fn label(&self, t: &Transition) -> String;
+    fn label(&self, t: Transition) -> String;
 
     /// Whether two operations on this object *conflict* — fail to commute, so the
     /// order in which they commit can change the outcome.

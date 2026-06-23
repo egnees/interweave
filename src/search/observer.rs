@@ -88,7 +88,7 @@ impl<'a, 'w> StepCx<'a, 'w> {
 
     /// A human-readable label for a *committed* transition (e.g. `"load -> 123"`).
     /// Panics on a transition that has not committed.
-    pub fn label(&self, t: &Transition) -> String {
+    pub fn label(&self, t: Transition) -> String {
         self.state.world().label(t)
     }
 

@@ -164,11 +164,11 @@ impl<T: Debug> Channel<T> {
         }
     }
 
-    fn label(&self, t: &Transition) -> String {
+    fn label(&self, t: Transition) -> String {
         let (_, rec) = self
             .history
             .iter()
-            .find(|(tt, _)| tt == t)
+            .find(|(tt, _)| *tt == t)
             .expect("label called on an unapplied transition");
         match rec {
             Record::Send { value } => format!("send {value}"),
@@ -220,7 +220,7 @@ impl<T: Debug + 'static> Object for ChannelHandle<T> {
         self.chan.borrow().enabled()
     }
 
-    fn label(&self, t: &Transition) -> String {
+    fn label(&self, t: Transition) -> String {
         self.chan.borrow().label(t)
     }
 

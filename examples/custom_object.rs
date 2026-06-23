@@ -136,12 +136,12 @@ impl Object for Counter {
             .collect()
     }
 
-    fn label(&self, t: &Transition) -> String {
+    fn label(&self, t: Transition) -> String {
         let st = self.state.borrow();
         let (_, op, observed) = st
             .history
             .iter()
-            .find(|(tt, _, _)| tt == t)
+            .find(|(tt, _, _)| *tt == t)
             .expect("label called on an unapplied transition");
         match op {
             Op::Inc => format!("inc ({observed} -> {})", observed + 1),
