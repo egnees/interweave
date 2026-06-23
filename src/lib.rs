@@ -66,6 +66,8 @@
 //! [`World::register`]. See [`Object`] for the operation lifecycle and the dependency relation that
 //! drives the reduction, and `examples/custom_object.rs` for a tiny worked primitive.
 
+#![warn(missing_docs)]
+
 mod model;
 mod search;
 mod sync;
