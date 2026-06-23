@@ -53,6 +53,10 @@ enum Record {
 struct Channel<T> {
     id: ObjectID,
     seq: usize,
+    // The single consumer's process id, fixed by the first `recv` registration. The
+    // `(Recv, Recv)` independence in `depends` is sound only with one consumer, so a
+    // second one is rejected (see `register`).
+    consumer: Option<usize>,
     // Committed-but-unreceived messages: (producing send's seq, value).
     queue: VecDeque<(usize, T)>,
     requests: Vec<Request<T>>,
@@ -64,6 +68,7 @@ impl<T: Debug> Channel<T> {
         Self {
             id,
             seq: 0,
+            consumer: None,
             queue: VecDeque::new(),
             requests: Vec::new(),
             history: Vec::new(),
@@ -72,6 +77,19 @@ impl<T: Debug> Channel<T> {
 
     fn register(&mut self, op: Op<T>, waker: Waker) {
         let transition = Transition::new(self.id, self.seq);
+        // Enforce the single-consumer invariant `depends` relies on: `recv` takes
+        // `&self`, so the type system cannot stop a shared `Receiver` (e.g. `Rc`) from
+        // recv-ing on two processes, which would make recv order observable and could
+        // hide reachable interleavings. Reject the second consumer loudly.
+        if matches!(op, Op::Recv { .. }) {
+            match self.consumer {
+                None => self.consumer = Some(transition.pid),
+                Some(c) => assert_eq!(
+                    c, transition.pid,
+                    "an MPSC channel has a single consumer; a Receiver must not be shared across processes"
+                ),
+            }
+        }
         self.seq += 1;
         self.requests.push(Request {
             transition,
@@ -274,8 +292,14 @@ impl<T: Debug> Sender<T> {
     }
 }
 
-/// The receiving half of an MPSC channel. Deliberately **not** `Clone`: the dependency relation
-/// relies on there being a single consumer, and `!Clone` enforces that at the type level.
+/// The receiving half of an MPSC channel. It is intentionally **not** `Clone`, because the
+/// channel's dependency relation assumes a single consumer.
+///
+/// That single-consumer invariant is a contract you must uphold, not one the type system can
+/// guarantee: [`recv`](Receiver::recv) takes `&self`, so nothing stops you from sharing one
+/// `Receiver` across processes (for instance behind an `Rc`). Doing so is rejected at run time
+/// with a panic — two consumers would make the receive order observable and could hide reachable
+/// interleavings.
 ///
 /// [`recv`](Receiver::recv) is an `async` method: awaiting it registers the recv and yields,
 /// blocking while the channel is empty.
@@ -380,6 +404,28 @@ mod tests {
         });
         assert_eq!(first.get(), 1);
         assert_eq!(second.get(), 2);
+    }
+
+    // Sharing one Receiver across two processes (via Rc, since recv takes &self) is a
+    // second consumer — rejected at registration to keep the (Recv, Recv) independence
+    // sound, which would otherwise hide reachable interleavings.
+    #[test]
+    #[should_panic(expected = "single consumer")]
+    fn second_consumer_panics() {
+        let (_driver, _tx, rx) = make();
+        let rx = Rc::new(rx);
+        let mut exec = Executor::default();
+        let r1 = rx.clone();
+        exec.schedule(async move {
+            r1.recv().await;
+            Ok(())
+        });
+        let r2 = rx.clone();
+        exec.schedule(async move {
+            r2.recv().await;
+            Ok(())
+        });
+        let _ = exec.execute(); // both recvs register; the second consumer panics
     }
 
     // A recv against an empty channel is withheld from `enabled` — that is the blocking mechanism.
