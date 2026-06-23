@@ -36,3 +36,28 @@ jobs:
 
       - name: Test
         run: cargo test --all-features
+
+      # Catch docs.rs-breaking changes (broken intra-doc links, doc warnings) and
+      # missing public docs on every PR — docs are the crate's public face.
+      - name: Doc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features
+
+      - name: Missing docs
+        run: cargo rustc --lib --all-features -- -D missing_docs
+
+  # Verify the crate still builds on its declared minimum supported Rust version
+  # (Cargo.toml `rust-version`), so the published MSRV stays an enforced contract.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo +1.85.0 check --locked --all-targets --all-features
