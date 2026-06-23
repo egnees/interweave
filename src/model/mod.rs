@@ -22,7 +22,6 @@ use crate::sync::{Atomic, ChannelHandle, Receiver, Sender};
 /// [`atomic`](World::atomic), and [`channel`](World::channel). That closure must be
 /// deterministic — building the same objects in the same order every time — because
 /// the search runs it repeatedly to explore different schedules.
-#[derive(Default)]
 pub struct World<'a> {
     objects: Vec<Box<dyn Object>>,
     exec: Executor<'a>,
@@ -31,6 +30,17 @@ pub struct World<'a> {
 }
 
 impl<'a> World<'a> {
+    // Built only by the search (via `State::new`); a user receives a `&mut World` in the
+    // `setup` closure and never constructs one, so construction stays crate-internal.
+    pub(crate) fn new() -> Self {
+        Self {
+            objects: Vec::new(),
+            exec: Executor::default(),
+            process_names: Vec::new(),
+            object_names: Vec::new(),
+        }
+    }
+
     /// Registers a named process. Every `.await` on a synchronization primitive
     /// inside `code` is a scheduling point. The name identifies this process wherever
     /// its [`Transition`]s are shown.
@@ -180,21 +190,12 @@ impl<'a> StateView<'a> {
         &self.trace
     }
 
-    // Rebuilds the live state at an arbitrary prefix in one replay from the root,
-    // keeping `setup` private to the view.
-    pub(crate) fn replay(&self, trace: Vec<Transition>) -> State<'a> {
-        Self {
-            setup: self.setup,
-            trace,
-        }
-        .state()
-    }
-
-    // Rebuilds the full state by replaying the recorded schedule. A view is a valid
-    // prefix by construction, so only its final state may carry a failure.
-    pub(crate) fn state(&self) -> State<'a> {
+    // Rebuilds the live state at an arbitrary prefix in one replay from the root. A
+    // view's `trace` is a valid prefix by construction, so only the final state may
+    // carry a failure; `setup` stays private to the view.
+    pub(crate) fn replay(&self, trace: &[Transition]) -> State<'a> {
         let mut state = State::new(self.setup);
-        for &t in &self.trace {
+        for &t in trace {
             debug_assert!(state.failure.is_none(), "replay diverged: early failure");
             debug_assert!(
                 state.enabled().contains(&t),
@@ -204,11 +205,16 @@ impl<'a> StateView<'a> {
         }
         state
     }
+
+    // Rebuilds the full state by replaying the recorded schedule.
+    pub(crate) fn state(&self) -> State<'a> {
+        self.replay(&self.trace)
+    }
 }
 
 impl<'a> State<'a> {
     fn new(setup: &'a dyn Fn(&mut World<'a>)) -> Self {
-        let mut world = World::default();
+        let mut world = World::new();
         setup(&mut world);
         let failure = world.run();
         let mut state = Self {

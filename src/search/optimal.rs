@@ -15,13 +15,16 @@ use crate::model::{State, StateView, Transition};
 
 // One wakeup-tree node: children in ≺ (sibling) order, `children[0]` the ≺-minimal
 // (explored first); `graft`/`insert` append new branches at the back. Each edge
-// carries its planned transition for dependency tests but is matched by `pid` (the
-// per-object `seq` is not stable across interleavings). For atomics `depends` is a
-// pure function of the two ops' kinds, so a carried edge resolves identically in any
-// state where both occur; for channels the send/recv case keys on the recv's
-// consumed send-seq, which drifts across interleavings (a racy upstream op shifts a
-// later send's seq), so `check_initial` re-stamps a carried edge to a live op of the
-// same pid/object before testing it against the current trace.
+// carries its planned transition, but only its `pid` is trusted: the per-object
+// `seq` is not stable across interleavings (a racy upstream op shifts a later op's
+// seq), and a process that touches one object twice would alias two ops by their
+// `(pid, oid)`. So `insert` / `check_initial` resolve each edge to its concrete op
+// by *replaying* the branch prefix and re-resolving by pid — the same pid-driven
+// replay the descent uses — and run the dependency tests against that replayed
+// state, where every op's kind is exact. (An earlier version resolved carried edges
+// against the maximal trace by `(pid, oid)`; that silently dropped reachable classes
+// whenever one process performed two differently-conflicting ops on one object, e.g.
+// the everyday `load` then `store` on a cell a third process also reads.)
 //
 // `pub(super)` (with a read accessor below) so the step-instrumentation module can
 // expose the live frontier tree through `WakeupNode`; the field stays private to this
@@ -131,7 +134,7 @@ pub(super) fn run<'a>(
         }
 
         if need_replay {
-            cur = view.replay(prefix.clone());
+            cur = view.replay(&prefix);
             need_replay = false;
             observer.step(
                 Step::Replay { prefix: &prefix },
@@ -318,6 +321,11 @@ fn plan_reversals(
             }
             let mut v = notdep(&clocks, trace, i);
             v.push(trace[j - 1]);
+            // E' = pre(E, e): the prefix just before e, where the reversing fragment v
+            // begins. `insert` / `covered_by_sleeper` replay it to resolve carried edges
+            // by pid (their seqs drift), and `runnable_after` replays it for the
+            // non-disabling test.
+            let prefix = &trace[..i - 1];
             // Non-disabling check (POPL'14 reversibility): the reversal is only legal if proc(e')
             // can actually run e' at the reordered prefix. For atomics this always holds (ops never
             // block); for a consuming send→recv it fails — e' (the recv) needs e (the send) to have
@@ -329,13 +337,14 @@ fn plan_reversals(
             // `RaceOutcome` (a free stack enum).
             let outcome = if !runnable_after(view, trace, &v, i) {
                 RaceOutcome::Disabling
-            } else if let Some(covering_pid) = covered_by_sleeper(state, &frames[i - 1], &v) {
+            } else if let Some(covering_pid) = covered_by_sleeper(view, prefix, &frames[i - 1], &v)
+            {
                 RaceOutcome::CoveredBySleeper {
                     insert_depth: i - 1,
                     covering_pid,
                 }
             } else {
-                match insert(node_at_mut(tree, i - 1), state, &v) {
+                match insert(node_at_mut(tree, i - 1), view, prefix, &v) {
                     InsertResult::ExistingLeaf => RaceOutcome::ExistingLeaf {
                         insert_depth: i - 1,
                     },
@@ -361,18 +370,20 @@ fn plan_reversals(
     }
 }
 
-// Algorithm 2 line 6: which process already asleep at prefix `pre` is a weak-initial
-// of `v` (covering the reversal), or `None` if none. `pending` is `cur.enabled()`
-// captured at `pre`, so a blocked recv is already excluded (it is not enabled) —
-// exactly the set this check needs.
-fn covered_by_sleeper(state: &State, pre: &Frame, v: &[Transition]) -> Option<usize> {
-    pre.sleep.iter().copied().find(|&q| {
-        pre.pending
-            .iter()
-            .copied()
-            .find(|t| t.pid == q)
-            .is_some_and(|q_t| check_initial(state, q_t, v).is_some())
-    })
+// Algorithm 2 line 6: which process already asleep at prefix E' is a weak-initial of
+// `v` (covering the reversal), or `None` if none. `check_initial` replays E' and its
+// leading `resolve` drops a sleeper that has finished or blocked there (not runnable),
+// so this is exactly the set the check needs.
+fn covered_by_sleeper(
+    view: &StateView,
+    prefix: &[Transition],
+    pre: &Frame,
+    v: &[Transition],
+) -> Option<usize> {
+    pre.sleep
+        .iter()
+        .copied()
+        .find(|&q| check_initial(view, prefix, q, v).is_some())
 }
 
 // The terminal shape of an `insert`: a fresh branch was grafted, or an existing leaf
@@ -384,65 +395,61 @@ enum InsertResult {
 }
 
 // insert[E'](v): descends the branch that is the longest weak-initial prefix of v
-// (stripping each matched process), then grafts the residual as a new branch.
-// Dependency tests run against the maximal `state` (the carried transitions resolve
-// identically there), so no replay is needed while descending.
-fn insert(node: &mut Wut, state: &State, v: &[Transition]) -> InsertResult {
+// (stripping each matched process), then grafts the residual as a new branch. Each
+// carried edge is resolved to its concrete op against the replayed prefix E' by pid
+// (its stored seq drifts across interleavings), so the dependency tests in
+// `check_initial` see the op's true kind. `prefix` is the transition prefix of `node`
+// (E' at the top call); it grows by the matched process's op on every descent.
+fn insert(
+    node: &mut Wut,
+    view: &StateView,
+    prefix: &[Transition],
+    v: &[Transition],
+) -> InsertResult {
     for idx in 0..node.children.len() {
-        let q_t = node.children[idx].0;
-        let Some(rest) = check_initial(state, q_t, v) else {
+        let q = node.children[idx].0.pid;
+        let Some((rest, q_t)) = check_initial(view, prefix, q, v) else {
             continue; // q is not a weak-initial of v: try the next sibling.
         };
         if node.children[idx].1.children.is_empty() {
             return InsertResult::ExistingLeaf; // an existing leaf already covers v.
         }
-        return insert(&mut node.children[idx].1, state, &rest);
+        let mut child_prefix = prefix.to_vec();
+        child_prefix.push(q_t);
+        return insert(&mut node.children[idx].1, view, &child_prefix, &rest);
     }
     node.graft(v);
     InsertResult::Grafted
 }
 
-// Re-stamp a carried wakeup-tree edge to an op valid in `state`. The edge's seq is
-// the per-object registration index from the interleaving that planted it, which is
-// NOT stable across interleavings (a racy upstream op shifts a later send's seq);
-// only the op-kind, fixed by the node's prefix, is stable. q's relevant op is its
-// first step from that prefix: `v`'s first event of q's pid when present, else (notdep
-// filtered it out) q's matching op still occurs in the live maximal trace.
-fn restamp(state: &State, q_t: Transition, v: &[Transition]) -> Transition {
-    if let Some(&t) = v.iter().find(|t| t.pid == q_t.pid && t.oid == q_t.oid) {
-        return t;
-    }
-    if let Some(&t) = state
-        .trace()
-        .iter()
-        .find(|t| t.pid == q_t.pid && t.oid == q_t.oid)
-    {
-        return t;
-    }
-    q_t // no same-(pid,oid) op in state: no same-oid vk reaches kind_of, so safe.
-}
-
-// Whether `q_t` (q's next op) is a weak-initial of `v`, and if so the residual (v
-// with q's first occurrence removed). The leading re-stamp swaps a carried edge for a
-// live op of the same pid/object, since channel seqs drift across interleavings and a
-// stale seq would panic in the channel's `kind_of`. Walking v from the front: q is
-// blocked if a v-event it depends on comes first; otherwise q's own occurrence (or
-// independence from all of v) makes it a weak-initial. q's op is stable while
-// stripping events independent of it, and `depends` is evaluated on the maximal
-// `state` where every event resolves — so no replay is needed.
-fn check_initial(state: &State, q_t: Transition, v: &[Transition]) -> Option<Vec<Transition>> {
-    let q_t = restamp(state, q_t, v);
+// Whether process `q` (a carried edge's pid) is a weak-initial of `v` at prefix E',
+// and if so the residual (v with q's first occurrence removed) plus q's concrete op at
+// E'. Replays E' to resolve q's op, then walks v re-resolving each event by pid and
+// advancing the replay, so every `depends` test sees the op kinds the reordered
+// prefix would actually run — no carried seq is trusted. q is not a weak-initial if a
+// v-event before it depends on it, or if q (or an earlier v-event) cannot run in this
+// reordering.
+fn check_initial(
+    view: &StateView,
+    prefix: &[Transition],
+    q: usize,
+    v: &[Transition],
+) -> Option<(Vec<Transition>, Transition)> {
+    let mut state = view.replay(prefix);
+    let q_t = resolve(&state, q)?; // q cannot run at E': not a weak-initial.
     for (k, &vk) in v.iter().enumerate() {
-        if vk.pid == q_t.pid {
+        if vk.pid == q {
             let mut rest = v.to_vec();
             rest.remove(k);
-            return Some(rest);
+            return Some((rest, q_t));
         }
-        if state.depends(vk, q_t) {
-            return None;
+        let vk_t = resolve(&state, vk.pid)?; // vk cannot run here: v is not realizable.
+        if state.depends(vk_t, q_t) {
+            return None; // a v-event before q depends on q.
         }
+        state.apply(vk_t);
     }
-    Some(v.to_vec())
+    Some((v.to_vec(), q_t))
 }
 
 // notdep(e, E): the events after e (index i, 1-based) that do not happen-after e,
@@ -484,7 +491,7 @@ fn reversible_race(
 // event being moved past it (a channel rf edge: removing the send blocks the recv).
 fn runnable_after(view: &StateView, trace: &[Transition], v: &[Transition], i: usize) -> bool {
     let (ep, notdep) = v.split_last().expect("v ends with e'");
-    let mut state = view.replay(trace[..i - 1].to_vec());
+    let mut state = view.replay(&trace[..i - 1]);
     for nd in notdep {
         let Some(t) = resolve(&state, nd.pid) else {
             return false;
@@ -1219,9 +1226,10 @@ mod tests {
 
     #[test]
     fn channel_seq_drift_no_panic() {
-        // Pins the stale-seq fix (`restamp`): without it Optimal panics in the
-        // channel's `kind_of` on a carried edge whose seq drifted. 3! send orders × 2
-        // for the g load/store race.
+        // A racy atomic op between sends drifts a later send's per-object seq across
+        // interleavings, so the wakeup tree must resolve carried edges by replay (a
+        // stale seq would panic in the channel's `kind_of`). 3! send orders × 2 for
+        // the g load/store race.
         assert_optimal(&seq_drift);
         assert_leaves(&seq_drift, 608, 12);
     }
@@ -1290,5 +1298,351 @@ mod tests {
     #[ignore]
     fn indexer_15_paper_count() {
         assert_eq!(leaves(&|w| indexer(w, 15)), 4096);
+    }
+
+    // --- same-object multi-op (wakeup-tree aliasing regression) ------------------
+    // A process performing two differently-conflicting ops on ONE object used to be
+    // aliased by `(pid, oid)` when a carried wakeup-tree edge was resolved, silently
+    // dropping reachable classes (and reachable failures). These pin that the everyday
+    // read-modify-write idiom keeps every class.
+
+    // The writer loads then stores x; a reader loads x. The reader can observe x's
+    // initial value (its load before the store) or the stored 1 — two classes.
+    fn read_modify_reader(world: &mut World) {
+        let x = world.atomic("x", 0u32);
+        let w = x.clone();
+        world.spawn("writer", async move {
+            let _ = w.load().await;
+            w.store(1).await;
+            Ok(())
+        });
+        spawn_load(world, "reader", x);
+    }
+
+    // Two processes each read-modify-write one shared cell: the lost-update data race.
+    fn double_counter(world: &mut World) {
+        let x = world.atomic("x", 0i32);
+        for i in 0..2 {
+            let c = x.clone();
+            world.spawn(format!("inc-{i}"), async move {
+                let v = c.load().await;
+                c.store(v + 1).await;
+                Ok(())
+            });
+        }
+    }
+
+    // A read-modify writer racing two readers on one cell.
+    fn read_modify_two_readers(world: &mut World) {
+        let x = world.atomic("x", 0u32);
+        let w = x.clone();
+        world.spawn("writer", async move {
+            let _ = w.load().await;
+            w.store(1).await;
+            Ok(())
+        });
+        spawn_load(world, "reader-1", x.clone());
+        spawn_load(world, "reader-2", x);
+    }
+
+    // The reader errors if it observes the pre-store value — an outcome only reachable
+    // on the class the aliasing bug dropped, so finding it proves soundness.
+    fn read_modify_killer(world: &mut World) {
+        let x = world.atomic("x", 0u32);
+        let w = x.clone();
+        world.spawn("writer", async move {
+            let _ = w.load().await;
+            w.store(1).await;
+            Ok(())
+        });
+        world.spawn("reader", async move {
+            if x.load().await == 1 {
+                Ok(())
+            } else {
+                Err("reader saw the pre-store value".into())
+            }
+        });
+    }
+
+    #[test]
+    fn read_modify_reader_keeps_both_classes() {
+        // 3 interleavings, 2 classes (reader sees 0 or 1). If the writer's load;store
+        // on x aliases, the reader-sees-0 class is dropped and this reads 1.
+        assert_leaves(&read_modify_reader, 3, 2);
+    }
+
+    #[test]
+    fn read_modify_two_readers_optimal() {
+        assert_optimal(&read_modify_two_readers);
+    }
+
+    #[test]
+    fn double_counter_optimal() {
+        assert_optimal(&double_counter);
+    }
+
+    #[test]
+    fn read_modify_finds_stale_read_identically() {
+        // Differential soundness: the reader-saw-0 failure is reachable, and Optimal
+        // must report it exactly as exhaustive DFS does.
+        let dfs = dfs_explore(&read_modify_killer, &mut ()).unwrap_err();
+        let opt = explore(&read_modify_killer, &mut ()).unwrap_err();
+        assert_eq!(opt.to_string(), dfs.to_string());
+    }
+
+    // A deterministic LCG, so the stress below is reproducible without a dependency.
+    fn lcg(s: &mut u64) -> u64 {
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *s >> 33
+    }
+
+    // A pseudo-random multi-op atomic program: two or three processes, each a short
+    // fixed sequence of load/store/cas over one or two shared cells. The aliasing bug
+    // hid reachable classes on exactly this shape, so `optimal == #classes` (and the
+    // ≤ DFS bound) across many shapes is the broad guard that would have caught it.
+    fn random_atomics(seed: u64, world: &mut World) {
+        let mut s = seed.wrapping_add(1);
+        let cells_n = 1 + (lcg(&mut s) % 2) as usize;
+        let cells: Vec<Atomic<i32>> = (0..cells_n)
+            .map(|i| world.atomic(format!("c{i}"), 0))
+            .collect();
+        let procs_n = 2 + (lcg(&mut s) % 2) as usize;
+        for p in 0..procs_n {
+            let ops_n = 1 + (lcg(&mut s) % 2) as usize;
+            let ops: Vec<(usize, u64, i32)> = (0..ops_n)
+                .map(|_| {
+                    (
+                        (lcg(&mut s) as usize) % cells_n,
+                        lcg(&mut s) % 3,
+                        (lcg(&mut s) % 3) as i32,
+                    )
+                })
+                .collect();
+            let cs = cells.clone();
+            world.spawn(format!("p{p}"), async move {
+                for (ci, kind, val) in ops {
+                    match kind {
+                        0 => {
+                            cs[ci].load().await;
+                        }
+                        1 => {
+                            cs[ci].store(val).await;
+                        }
+                        _ => {
+                            let _ = cs[ci].compare_exchange(0, val).await;
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn random_atomics_optimal_matches_classes() {
+        for seed in 0..64u64 {
+            assert_optimal(&|w| random_atomics(seed, w));
+        }
+    }
+
+    // Two producers each send twice on one channel; the consumer recvs all four. Each
+    // producer's two sends are a same-object multi-op, forcing a deep wakeup-tree
+    // descent — the channel analog of the atomic read-modify regression above.
+    fn two_producers_two_sends(world: &mut World) {
+        let (tx, rx) = world.channel::<i32>("ch");
+        let tx2 = tx.clone();
+        world.spawn("producer-a", async move {
+            tx.send(1).await;
+            tx.send(2).await;
+            Ok(())
+        });
+        world.spawn("producer-b", async move {
+            tx2.send(3).await;
+            tx2.send(4).await;
+            Ok(())
+        });
+        world.spawn("consumer", async move {
+            for _ in 0..4 {
+                rx.recv().await;
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn channel_two_producers_two_sends_optimal() {
+        // Program order fixes 1<2 and 3<4; the only freedom is interleaving the two
+        // ordered send-pairs into the consumer's FIFO ⇒ C(4,2) = 6 classes.
+        assert_optimal(&two_producers_two_sends);
+        assert_eq!(leaves(&two_producers_two_sends), 6);
+    }
+
+    // The reader loads x then, by the value it read, does a SECOND op on the SAME cell
+    // (store x) or on a different one (load y) — data-dependent control flow whose
+    // taken arm is itself a same-object multi-op, racing the writer on x.
+    fn branch_same_cell(world: &mut World) {
+        let x = world.atomic("x", 0i32);
+        let y = world.atomic("y", 0i32);
+        spawn_store(world, "writer", x.clone(), 1);
+        world.spawn("reader", async move {
+            if x.load().await == 0 {
+                x.store(2).await;
+            } else {
+                y.load().await;
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn branch_same_cell_optimal() {
+        assert_optimal(&branch_same_cell);
+    }
+
+    // A user-defined `Object` driven through `World::register`, pinning that the central
+    // extension point is explored correctly (the `examples/custom_object.rs` showcase is
+    // compiled but never run in CI, and asserts nothing).
+    mod custom_object {
+        use std::cell::{Cell, RefCell};
+        use std::future::poll_fn;
+        use std::rc::Rc;
+        use std::task::{Poll, Waker};
+
+        use crate::model::{Object, ObjectID, Transition, World};
+
+        #[derive(Clone, Copy)]
+        enum Op {
+            Inc,
+            Get,
+        }
+
+        struct Req {
+            transition: Transition,
+            waker: Waker,
+            op: Op,
+            done: Rc<Cell<bool>>,
+        }
+
+        #[derive(Default)]
+        struct Inner {
+            count: usize,
+            seq: usize,
+            requests: Vec<Req>,
+            history: Vec<(Transition, Op)>,
+        }
+
+        #[derive(Clone)]
+        struct Counter {
+            id: ObjectID,
+            inner: Rc<RefCell<Inner>>,
+        }
+
+        impl Counter {
+            fn new(id: ObjectID) -> Self {
+                Self {
+                    id,
+                    inner: Rc::new(RefCell::new(Inner::default())),
+                }
+            }
+
+            async fn op(&self, op: Op) {
+                let done = Rc::new(Cell::new(false));
+                let mut pending = Some(op);
+                poll_fn(move |cx| {
+                    if done.get() {
+                        return Poll::Ready(());
+                    }
+                    if let Some(op) = pending.take() {
+                        let mut st = self.inner.borrow_mut();
+                        let transition = Transition::new(self.id, st.seq);
+                        st.seq += 1;
+                        st.requests.push(Req {
+                            transition,
+                            waker: cx.waker().clone(),
+                            op,
+                            done: Rc::clone(&done),
+                        });
+                    }
+                    Poll::Pending
+                })
+                .await
+            }
+
+            fn op_of(&self, t: Transition) -> Op {
+                let st = self.inner.borrow();
+                st.requests
+                    .iter()
+                    .map(|r| (r.transition, r.op))
+                    .chain(st.history.iter().map(|(tt, op)| (*tt, *op)))
+                    .find(|(tt, _)| *tt == t)
+                    .map(|(_, op)| op)
+                    .expect("transition registered on this counter")
+            }
+        }
+
+        impl Object for Counter {
+            fn apply(&mut self, t: Transition) {
+                let mut st = self.inner.borrow_mut();
+                let i = st
+                    .requests
+                    .iter()
+                    .position(|r| r.transition == t)
+                    .expect("transition must be enabled");
+                let req = st.requests.remove(i);
+                if let Op::Inc = req.op {
+                    st.count += 1;
+                }
+                st.history.push((t, req.op));
+                req.done.set(true);
+                req.waker.wake();
+            }
+
+            fn enabled(&self) -> Vec<Transition> {
+                self.inner
+                    .borrow()
+                    .requests
+                    .iter()
+                    .map(|r| r.transition)
+                    .collect()
+            }
+
+            fn label(&self, t: Transition) -> String {
+                match self.op_of(t) {
+                    Op::Inc => "inc".into(),
+                    Op::Get => "get".into(),
+                }
+            }
+
+            fn depends(&self, t1: Transition, t2: Transition) -> bool {
+                !matches!((self.op_of(t1), self.op_of(t2)), (Op::Get, Op::Get))
+            }
+        }
+
+        fn program(world: &mut World) {
+            let c = world.register("counter", Counter::new);
+            let (a, b, r) = (c.clone(), c.clone(), c);
+            world.spawn("inc-a", async move {
+                a.op(Op::Inc).await;
+                Ok(())
+            });
+            world.spawn("inc-b", async move {
+                b.op(Op::Inc).await;
+                Ok(())
+            });
+            world.spawn("reader", async move {
+                r.op(Op::Get).await;
+                Ok(())
+            });
+        }
+
+        #[test]
+        fn register_extension_point_explored_optimally() {
+            // inc/inc and inc/get conflict, get/get commute; with one reader every pair
+            // conflicts ⇒ 3! = 6 Mazurkiewicz classes, one trace each under Optimal.
+            super::assert_optimal(&program);
+            assert_eq!(super::leaves(&program), 6);
+        }
     }
 }
