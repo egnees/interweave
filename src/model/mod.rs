@@ -56,6 +56,7 @@ impl<'a> World<'a> {
 
     /// Creates a named shared [`Atomic`] cell, returning a cloneable handle whose
     /// `load` / `store` / `compare_exchange` operations are scheduling points.
+    #[must_use = "the returned handle must be given to a process; an object no process holds is never operated on"]
     pub fn atomic<T: Copy + PartialEq + Debug + 'static>(
         &mut self,
         name: impl Into<String>,
@@ -67,6 +68,7 @@ impl<'a> World<'a> {
     /// Creates a named unbounded MPSC channel, returning a cloneable [`Sender`]
     /// (multi-producer) and a single [`Receiver`] (not cloneable). Every `send` and
     /// `recv` is a scheduling point; a `recv` on an empty channel blocks.
+    #[must_use = "the returned sender/receiver must be given to processes; an unused channel is never operated on"]
     pub fn channel<T: Debug + 'static>(
         &mut self,
         name: impl Into<String>,
@@ -84,6 +86,7 @@ impl<'a> World<'a> {
     /// cell. This is the extension point behind [`atomic`](World::atomic) and
     /// [`channel`](World::channel) — implement [`Object`] for your own lock, channel, or
     /// barrier and register it here.
+    #[must_use = "the returned handle must be given to a process; an object no process holds is never operated on"]
     pub fn register<O>(&mut self, name: impl Into<String>, build: impl FnOnce(ObjectID) -> O) -> O
     where
         O: Object + Clone + 'static,
