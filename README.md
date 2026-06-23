@@ -4,10 +4,16 @@
 [![crates.io](https://img.shields.io/crates/v/interweave.svg)](https://crates.io/crates/interweave)
 [![docs.rs](https://img.shields.io/docsrs/interweave)](https://docs.rs/interweave)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![MSRV: 1.85](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
 Stateless model-checking sandbox built around **Optimal DPOR** — find the
 interleaving that breaks a small concurrent program, and watch the algorithm
 decide which interleavings to explore and which to prune.
+
+> **Status:** an early-stage research sandbox (`0.x`). The API is still taking
+> shape and may change between minor releases, and it is built for *exploring*
+> small concurrent programs and the DPOR reduction itself rather than as a
+> production model checker.
 
 ## What it is
 
@@ -142,9 +148,26 @@ for line in &seen.0 {
 `Step` also reports the driver's other decisions — descend, seed, race-reversal,
 pop — each carrying the live wakeup tree and sleep sets.
 
-More worked programs — a bank ledger, a from-scratch custom `Object`, and the
-POPL'14 `readers` / `lastzero` / `indexer` benchmarks — live in
-[`examples/`](examples); the full API is on [docs.rs](https://docs.rs/interweave).
+More worked programs live in [`examples/`](examples): a `bank` ledger and the
+`publish` unsafe-publication race (atomic bug hunts), an `rpc_mux` reply-misrouting
+bug over an MPSC channel, a from-scratch custom `Object` (`custom_object`), and the
+POPL'14 `readers` / `lastzero` / `indexer` benchmarks. The full API is on
+[docs.rs](https://docs.rs/interweave).
+
+## Contributing
+
+Issues and pull requests are welcome. Before sending a change, run the checks CI does:
+
+```sh
+cargo +nightly fmt --all -- --check   # formatting (see note below)
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo rustc --lib --all-features -- -D missing_docs
+```
+
+CI also checks the build on the 1.85 MSRV. Formatting requires **nightly** `rustfmt`
+because `rustfmt.toml` enables unstable options (`wrap_comments`, `comment_width`).
 
 ## References
 
