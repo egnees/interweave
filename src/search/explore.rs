@@ -152,4 +152,26 @@ mod tests {
         assert_eq!(failed.to_string(), "deadlock");
         failed.play();
     }
+
+    // A consumer recvs more than the single producer sends: after the one message the
+    // second recv blocks forever with no producer left, so the channel's withhold →
+    // `settle` path must surface a deadlock through the search.
+    fn starved_consumer(world: &mut World) {
+        let (tx, rx) = world.channel::<i32>("ch");
+        world.spawn("producer", async move {
+            tx.send(1).await;
+            Ok(())
+        });
+        world.spawn("consumer", async move {
+            rx.recv().await;
+            rx.recv().await; // nothing left to receive
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn channel_starvation_is_deadlock() {
+        let failed = explore(&starved_consumer, &mut ()).unwrap_err();
+        assert_eq!(failed.to_string(), "deadlock");
+    }
 }
