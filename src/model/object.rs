@@ -38,9 +38,7 @@ impl Transition {
     /// `seq` is part of the transition's identity and is compared by value across
     /// the whole search, so use a per-object counter that bumps on every
     /// registration and never reuses a value for the object's lifetime (what
-    /// [`Atomic`](crate::Atomic) does). Reusing one after its transition was retired
-    /// would alias two distinct operations and break the checker's deterministic
-    /// re-execution.
+    /// [`Atomic`](crate::Atomic) does).
     pub fn new(oid: ObjectID, seq: usize) -> Self {
         Self {
             pid: pid(),
@@ -117,10 +115,8 @@ pub trait Object {
     /// becomes runnable; that is how a primitive blocks a process.
     fn enabled(&self) -> Vec<Transition>;
 
-    /// Appends the currently-enabled transitions to `out` instead of allocating a
-    /// fresh [`Vec`]. The search recomputes the enabled set on every committed step,
-    /// so overriding this to push directly into the shared buffer avoids a per-object
-    /// allocation on the hot path. The default defers to [`enabled`](Object::enabled).
+    /// Appends the currently-enabled transitions to `out`. The default defers to
+    /// [`enabled`](Object::enabled).
     fn enabled_into(&self, out: &mut Vec<Transition>) {
         out.extend(self.enabled());
     }
@@ -134,12 +130,9 @@ pub trait Object {
     /// [`enabled`](Object::enabled) while registered — i.e. whether the object can
     /// block a process (a `recv` on an empty channel, a `lock` on a held mutex).
     ///
-    /// This is a pure-performance hint, never a correctness lever: when *every*
-    /// registered object reports `false`, the strategy can skip the replay it would
-    /// otherwise run to confirm that reversing a race leaves the later operation
-    /// runnable — for a never-blocking primitive that confirmation is always
-    /// positive. Default `true` (conservative: a custom object is assumed able to
-    /// block); [`Atomic`](crate::Atomic) overrides it to `false`.
+    /// Default `true` (a custom object is assumed able to block);
+    /// [`Atomic`](crate::Atomic) overrides it to `false`. Returning `false` for an
+    /// object that can in fact withhold a registered operation is unsound.
     fn may_block(&self) -> bool {
         true
     }
@@ -147,11 +140,10 @@ pub trait Object {
     /// Whether two operations on this object *conflict* — fail to commute, so the
     /// order in which they commit can change the outcome.
     ///
-    /// This is the dependency relation that drives the partial-order reduction: the
-    /// fewer pairs reported dependent, the more interleavings are pruned, so report
-    /// `true` only when the operations genuinely interfere (two reads commute; a
-    /// write conflicts with reads and writes). Reporting too few dependencies is
-    /// *unsound* — it can hide reachable states — so when in doubt, return `true`.
+    /// Report `true` only when the operations genuinely interfere (two reads
+    /// commute; a write conflicts with reads and writes). Reporting too few
+    /// dependencies is *unsound* — it can hide reachable states — so when in doubt,
+    /// return `true`.
     ///
     /// The relation may depend on committed state, not only on the two operations'
     /// kinds — a channel `recv`, say, conflicts with a `send` only when it consumed that
