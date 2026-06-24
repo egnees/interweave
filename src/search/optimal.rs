@@ -18,13 +18,15 @@ use crate::model::{State, StateView, Transition};
 // carries its planned transition, but only its `pid` is trusted: the per-object
 // `seq` is not stable across interleavings (a racy upstream op shifts a later op's
 // seq), and a process that touches one object twice would alias two ops by their
-// `(pid, oid)`. So `insert` / `check_initial` resolve each edge to its concrete op
-// by *replaying* the branch prefix and re-resolving by pid — the same pid-driven
-// replay the descent uses — and run the dependency tests against that replayed
-// state, where every op's kind is exact. (An earlier version resolved carried edges
-// against the maximal trace by `(pid, oid)`; that silently dropped reachable classes
-// whenever one process performed two differently-conflicting ops on one object, e.g.
-// the everyday `load` then `store` on a cell a third process also reads.)
+// `(pid, oid)`. So `insert` / `weak_initial_walk` resolve each edge to its concrete op
+// against a *replayed* branch prefix, re-resolving by pid — the same pid-driven replay
+// the descent uses — and run the dependency tests against that live state, where every
+// op's kind is exact. (`insert` replays the branch prefix once and threads the live
+// state down its descent, replaying again only where a walk advanced the state past
+// events the next level still needs.) An earlier version resolved carried edges against
+// the maximal trace by `(pid, oid)`; that silently dropped reachable classes whenever
+// one process performed two differently-conflicting ops on one object, e.g. the everyday
+// `load` then `store` on a cell a third process also reads.
 //
 // `pub(super)` (with a read accessor below) so the step-instrumentation module can
 // expose the live frontier tree through `WakeupNode`; the field stays private to this
@@ -337,7 +339,8 @@ fn plan_reversals(
             // `RaceOutcome` (a free stack enum).
             let outcome = if !runnable_after(view, trace, &v, i) {
                 RaceOutcome::Disabling
-            } else if let Some(covering_pid) = covered_by_sleeper(view, prefix, &frames[i - 1], &v)
+            } else if let Some(covering_pid) =
+                covered_by_sleeper(view, prefix, &frames[i - 1].sleep, &v)
             {
                 RaceOutcome::CoveredBySleeper {
                     insert_depth: i - 1,
@@ -370,20 +373,20 @@ fn plan_reversals(
     }
 }
 
-// Algorithm 2 line 6: which process already asleep at prefix E' is a weak-initial of
-// `v` (covering the reversal), or `None` if none. `check_initial` replays E' and its
-// leading `resolve` drops a sleeper that has finished or blocked there (not runnable),
-// so this is exactly the set the check needs.
+// Algorithm 2 line 6: which process already asleep at prefix E' is a weak-initial of `v`
+// (covering the reversal), or `None`. Free when nothing sleeps there (the common case):
+// only an empty walk, no replay. Otherwise one replay + walk classifies every sleeper.
 fn covered_by_sleeper(
     view: &StateView,
     prefix: &[Transition],
-    pre: &Frame,
+    sleep: &[usize],
     v: &[Transition],
 ) -> Option<usize> {
-    pre.sleep
-        .iter()
-        .copied()
-        .find(|&q| check_initial(view, prefix, q, v).is_some())
+    if sleep.is_empty() {
+        return None;
+    }
+    let mut state = view.replay(prefix);
+    weak_initial_walk(&mut state, sleep, v).map(|m| sleep[m.child])
 }
 
 // The terminal shape of an `insert`: a fresh branch was grafted, or an existing leaf
@@ -395,61 +398,147 @@ enum InsertResult {
 }
 
 // insert[E'](v): descends the branch that is the longest weak-initial prefix of v
-// (stripping each matched process), then grafts the residual as a new branch. Each
-// carried edge is resolved to its concrete op against the replayed prefix E' by pid
-// (its stored seq drifts across interleavings), so the dependency tests in
-// `check_initial` see the op's true kind. `prefix` is the transition prefix of `node`
-// (E' at the top call); it grows by the matched process's op on every descent.
+// (stripping each matched process), then grafts the residual as a new branch. One root
+// replay rebuilds E'; the descent then threads that live state forward instead of
+// re-replaying each child prefix (see `insert_rec`).
 fn insert(
     node: &mut Wut,
     view: &StateView,
     prefix: &[Transition],
     v: &[Transition],
 ) -> InsertResult {
-    for idx in 0..node.children.len() {
-        let q = node.children[idx].0.pid;
-        let Some((rest, q_t)) = check_initial(view, prefix, q, v) else {
-            continue; // q is not a weak-initial of v: try the next sibling.
-        };
-        if node.children[idx].1.children.is_empty() {
-            return InsertResult::ExistingLeaf; // an existing leaf already covers v.
-        }
-        let mut child_prefix = prefix.to_vec();
-        child_prefix.push(q_t);
-        return insert(&mut node.children[idx].1, view, &child_prefix, &rest);
-    }
-    node.graft(v);
-    InsertResult::Grafted
+    let state = view.replay(prefix);
+    insert_rec(node, view, prefix.to_vec(), state, v)
 }
 
-// Whether process `q` (a carried edge's pid) is a weak-initial of `v` at prefix E',
-// and if so the residual (v with q's first occurrence removed) plus q's concrete op at
-// E'. Replays E' to resolve q's op, then walks v re-resolving each event by pid and
-// advancing the replay, so every `depends` test sees the op kinds the reordered
-// prefix would actually run — no carried seq is trusted. q is not a weak-initial if a
-// v-event before it depends on it, or if q (or an earlier v-event) cannot run in this
-// reordering.
-fn check_initial(
+// The descent of `insert`, carrying the live state at the node's prefix so most levels
+// avoid a re-replay. `weak_initial_walk` finds the matching child by walking `state`.
+// When the match is the residual's head — its first event (a `clean`, zero-apply walk,
+// the overwhelmingly common case) — the state is still exactly at `prefix`, so applying
+// the matched op reaches the child prefix and the same live state is threaded into the
+// recursion. Otherwise the walk advanced the state past independent events that the
+// child still needs re-inserted, so the child prefix is rebuilt by one replay. Either
+// way `prefix` tracks the node's true transition prefix for that fallback.
+fn insert_rec(
+    node: &mut Wut,
     view: &StateView,
-    prefix: &[Transition],
-    q: usize,
+    prefix: Vec<Transition>,
+    mut state: State,
     v: &[Transition],
-) -> Option<(Vec<Transition>, Transition)> {
-    let mut state = view.replay(prefix);
-    let q_t = resolve(&state, q)?; // q cannot run at E': not a weak-initial.
+) -> InsertResult {
+    let pids: Vec<usize> = node.children.iter().map(|(t, _)| t.pid).collect();
+    let Some(m) = weak_initial_walk(&mut state, &pids, v) else {
+        node.graft(v); // no child is a weak-initial of v: graft the residual here.
+        return InsertResult::Grafted;
+    };
+    if node.children[m.child].1.children.is_empty() {
+        return InsertResult::ExistingLeaf; // an existing leaf already covers v.
+    }
+    let mut child_prefix = prefix;
+    child_prefix.push(m.q_t);
+    let subtree = &mut node.children[m.child].1;
+    if m.clean {
+        // Zero applies: `state` is still at the node's prefix and the match was the
+        // residual's head, so applying its op reaches the child prefix exactly.
+        state.apply(m.q_t);
+        insert_rec(subtree, view, child_prefix, state, &m.rest)
+    } else {
+        // The walk advanced `state` past independent events that are part of `rest`;
+        // rebuild the child prefix from scratch so they are not double-applied.
+        let child_state = view.replay(&child_prefix);
+        insert_rec(subtree, view, child_prefix, child_state, &m.rest)
+    }
+}
+
+// A weak-initial match: the chosen candidate index, the residual (v minus its first
+// occurrence), its concrete op q_t, and whether the walk made no applies (`clean`).
+struct WeakInitial {
+    child: usize,
+    rest: Vec<Transition>,
+    q_t: Transition,
+    clean: bool,
+}
+
+// One walk of `v` over the live `state` (already at the relevant prefix) classifying
+// every candidate pid, returning the first candidate (in order) that is a weak-initial.
+// Replaces a per-candidate `check_initial`: each candidate's q_t is resolved up front
+// (applying another process's op never changes a not-yet-applied process's next op);
+// then for each `vk` in order a candidate is *matched* when `vk.pid` is it, or *killed*
+// when an earlier `vk` depends on its q_t or when some `vk` cannot run here (v not
+// realizable — e.g. data-dependent control flow took another branch). The single walk
+// applies every resolvable `vk` so a process recurring in `v` re-resolves against the
+// advanced state, exactly as the isolated walk would. q's seq is not trusted; only its
+// pid drives the resolve. `clean` is true iff no apply happened — i.e. the early exit
+// fired on the very first event, so the winner matched at occurrence 0 and `state` is
+// untouched; the caller relies on this to thread `state` forward without a replay.
+fn weak_initial_walk(
+    state: &mut State,
+    candidates: &[usize],
+    v: &[Transition],
+) -> Option<WeakInitial> {
+    if candidates.is_empty() {
+        return None;
+    }
+    // q_t per candidate, resolved before any apply. None ⇒ q cannot run here ⇒ not a
+    // weak-initial (pre-killed).
+    let q_ts: Vec<Option<Transition>> = candidates.iter().map(|&q| resolve(state, q)).collect();
+    let mut matched: Vec<Option<usize>> = vec![None; candidates.len()];
+    let mut killed: Vec<bool> = q_ts.iter().map(Option::is_none).collect();
+    let mut applies = 0usize;
+    // The winner is the first not-killed candidate; build its residual from `matched`.
+    let win = |matched: &[Option<usize>], killed: &[bool], applies: usize| -> Option<WeakInitial> {
+        let child = (0..candidates.len()).find(|&ci| !killed[ci])?;
+        let rest = match matched[child] {
+            Some(k) => {
+                let mut r = v.to_vec();
+                r.remove(k);
+                r
+            }
+            None => v.to_vec(),
+        };
+        Some(WeakInitial {
+            child,
+            rest,
+            q_t: q_ts[child].unwrap(),
+            clean: applies == 0,
+        })
+    };
+
     for (k, &vk) in v.iter().enumerate() {
-        if vk.pid == q {
-            let mut rest = v.to_vec();
-            rest.remove(k);
-            return Some((rest, q_t));
+        // A candidate whose pid is vk matches here (distinct pids ⇒ at most one). This
+        // mirrors `check_initial` returning before it resolves/depends-tests vk.
+        for ci in 0..candidates.len() {
+            if !killed[ci] && matched[ci].is_none() && vk.pid == candidates[ci] {
+                matched[ci] = Some(k);
+            }
         }
-        let vk_t = resolve(&state, vk.pid)?; // vk cannot run here: v is not realizable.
-        if state.depends(vk_t, q_t) {
-            return None; // a v-event before q depends on q.
+        // Early exit: once the highest-priority surviving candidate has matched, every
+        // higher-priority candidate is killed and lower ones can't outrank it, so the
+        // rest of the walk (and its applies) can't change the answer.
+        if let Some(ci) = (0..candidates.len()).find(|&ci| !killed[ci])
+            && matched[ci].is_some()
+        {
+            return win(&matched, &killed, applies);
+        }
+        let Some(vk_t) = resolve(state, vk.pid) else {
+            // vk is unrealizable here: every candidate not already matched is killed.
+            for ci in 0..candidates.len() {
+                if matched[ci].is_none() {
+                    killed[ci] = true;
+                }
+            }
+            break;
+        };
+        for ci in 0..candidates.len() {
+            if !killed[ci] && matched[ci].is_none() && state.depends(vk_t, q_ts[ci].unwrap()) {
+                killed[ci] = true;
+            }
         }
         state.apply(vk_t);
+        applies += 1;
     }
-    Some((v.to_vec(), q_t))
+
+    win(&matched, &killed, applies)
 }
 
 // Per-event vector clocks stored as one flat row-major buffer: `clock(k)[pid]` lives at
