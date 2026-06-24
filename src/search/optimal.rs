@@ -281,15 +281,15 @@ fn seed_child(
 ) {
     let depth = prefix.len();
     let child_sleep = &frames.last().unwrap().sleep;
-    if node_at(tree, depth).children.is_empty() {
-        if let Some(q) = seed(cur, child_sleep) {
-            debug_assert!(
-                !child_sleep.contains(&q),
-                "sleep-set-blocked state under Optimal DPOR"
-            );
-            let q_t = resolve(cur, q).expect("a seeded process must be runnable");
-            node_at_mut(tree, depth).graft(&[q_t]);
-        }
+    if node_at(tree, depth).children.is_empty()
+        && let Some(q) = seed(cur, child_sleep)
+    {
+        debug_assert!(
+            !child_sleep.contains(&q),
+            "sleep-set-blocked state under Optimal DPOR"
+        );
+        let q_t = resolve(cur, q).expect("a seeded process must be runnable");
+        node_at_mut(tree, depth).graft(&[q_t]);
     }
     // The child node's head edge after seeding (matched by pid; its seq drifts,
     // so a consumer reads only the pid).
