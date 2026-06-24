@@ -248,6 +248,11 @@ impl<T: Copy + PartialEq + Debug + 'static> Object for Handle<T> {
         self.atomic.borrow().enabled_into(out);
     }
 
+    // Atomic operations never block: a registered op is always enabled.
+    fn may_block(&self) -> bool {
+        false
+    }
+
     fn label(&self, t: Transition) -> String {
         self.atomic.borrow().label(t)
     }

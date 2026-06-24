@@ -315,6 +315,7 @@ fn plan_reversals(
 ) {
     let n = trace.len();
     let clocks = event_clocks(state, trace);
+    let non_blocking = state.non_blocking();
 
     for j in 1..=n {
         for i in 1..j {
@@ -325,8 +326,8 @@ fn plan_reversals(
             v.push(trace[j - 1]);
             // E' = pre(E, e): the prefix just before e, where the reversing fragment v
             // begins. `insert` / `covered_by_sleeper` replay it to resolve carried edges
-            // by pid (their seqs drift), and `runnable_after` replays it for the
-            // non-disabling test.
+            // by pid (their seqs drift, and a process may hit two ops on one object),
+            // and `runnable_after` replays it for the non-disabling test.
             let prefix = &trace[..i - 1];
             // Non-disabling check (POPL'14 reversibility): the reversal is only legal if proc(e')
             // can actually run e' at the reordered prefix. For atomics this always holds (ops never
@@ -336,8 +337,11 @@ fn plan_reversals(
             //
             // This if/else IS the algorithm (the same short-circuit `runnable_after` →
             // `covered_by_sleeper` → `insert`); it merely also names the branch as a
-            // `RaceOutcome` (a free stack enum).
-            let outcome = if !runnable_after(view, trace, &v, i) {
+            // `RaceOutcome` (a free stack enum). When no object can block, reversing a
+            // race always leaves e' runnable (a never-blocking op stays enabled, and the
+            // notdep reordering is causally independent of e so it cannot newly fail), so
+            // `runnable_after` is provably `true` and the replay it would run is skipped.
+            let outcome = if !non_blocking && !runnable_after(view, trace, &v, i) {
                 RaceOutcome::Disabling
             } else if let Some(covering_pid) =
                 covered_by_sleeper(view, prefix, &frames[i - 1].sleep, &v)

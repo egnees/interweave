@@ -130,6 +130,20 @@ pub trait Object {
     /// may rely on recorded history.
     fn label(&self, t: Transition) -> String;
 
+    /// Whether an operation on this object can ever be *withheld* from
+    /// [`enabled`](Object::enabled) while registered — i.e. whether the object can
+    /// block a process (a `recv` on an empty channel, a `lock` on a held mutex).
+    ///
+    /// This is a pure-performance hint, never a correctness lever: when *every*
+    /// registered object reports `false`, the strategy can skip the replay it would
+    /// otherwise run to confirm that reversing a race leaves the later operation
+    /// runnable — for a never-blocking primitive that confirmation is always
+    /// positive. Default `true` (conservative: a custom object is assumed able to
+    /// block); [`Atomic`](crate::Atomic) overrides it to `false`.
+    fn may_block(&self) -> bool {
+        true
+    }
+
     /// Whether two operations on this object *conflict* — fail to commute, so the
     /// order in which they commit can change the outcome.
     ///

@@ -191,6 +191,10 @@ pub struct State<'a> {
     // objects, which on the replay-heavy hot path saves a per-object allocation per
     // access.
     enabled: Vec<Transition>,
+    // Whether no registered object can block a process (every object reports
+    // `!may_block`). Fixed by the object set, so computed once at construction. Lets
+    // the strategy skip the non-disabling replay check (see `runnable_after`).
+    non_blocking: bool,
 }
 
 impl Debug for State<'_> {
@@ -247,16 +251,25 @@ impl<'a> State<'a> {
         let mut world = World::new();
         setup(&mut world);
         let failure = world.run();
+        let non_blocking = world.objects.iter().all(|o| !o.may_block());
         let mut state = Self {
             world,
             setup,
             trace: Vec::new(),
             failure,
             enabled: Vec::new(),
+            non_blocking,
         };
         state.recompute_enabled();
         state.settle();
         state
+    }
+
+    // Whether no registered object can block a process. When true, reversing a race
+    // always leaves the later op runnable, so the strategy skips the replay-based
+    // non-disabling check (`runnable_after`).
+    pub(crate) fn non_blocking(&self) -> bool {
+        self.non_blocking
     }
 
     /// The underlying [`World`], for resolving names and labels of this state's
