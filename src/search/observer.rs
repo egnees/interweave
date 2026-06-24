@@ -6,9 +6,7 @@
 //! below. [`Step::Visit`] is the per-state signal: it fires for every state the search
 //! reaches (the root, then each freshly-applied prefix), so a consumer recovers
 //! "every state / terminal" via `cx.state()` + `is_terminal()`. `step` is a no-op by
-//! default, so plain `explore` pays nothing: every emit site passes a `Step<'_>`
-//! referencing data the driver already holds, and an observer that ignores steps reads
-//! none of it. These step types are public so a visualizer is built *on top of* the
+//! default. These step types are public so a visualizer is built *on top of* the
 //! crate — a pure consumer of [`Observer::step`] plus the public `model` surface, the
 //! same way any external consumer would.
 
@@ -24,7 +22,7 @@ use crate::model::{ObjectID, ProcessID, State, Transition};
 /// views. One of those decisions, [`Step::Visit`], fires for every state the search
 /// reaches — runnable, terminal, or failed — so an implementor can inspect failures,
 /// count maximal traces, or record the tree. `step` is a no-op by default, so an
-/// observer that watches only a few decisions ignores the rest at zero cost.
+/// observer can implement only the decisions it cares about.
 ///
 /// An observer only *reads* the search: it cannot steer it and cannot fail it, so it is
 /// not the place to check program properties — express those as checks inside the
@@ -33,8 +31,7 @@ use crate::model::{ObjectID, ProcessID, State, Transition};
 pub trait Observer {
     /// Called at each discrete decision of the Optimal DPOR driver (descend, seed,
     /// race-reversal, pop, …), including [`Step::Visit`] for every visited state.
-    /// Default no-op: an observer that only watches some steps ignores the rest at
-    /// zero cost.
+    /// Default no-op.
     fn step(&mut self, step: Step<'_>, cx: StepCx<'_, '_>) {
         let _ = (step, cx);
     }
@@ -47,10 +44,10 @@ impl Observer for () {}
 // own setup lifetime. They are decoupled because `State<'w>` is invariant over `'w`
 // (it holds a `&'w dyn Fn`), so tying them would force the borrow to live as long as
 // the whole search.
-/// The read-only context accompanying a [`Step`]: the live [`State`] (for resolving
-/// names and labels), the committed `prefix`, the per-depth sleep sets and pending
-/// operations, and the frontier wakeup tree. Everything is borrowed for the
-/// [`step`](Observer::step) call — clone out what you need to keep.
+/// The read-only context accompanying a [`Step`]: the live [`State`], the committed
+/// `prefix`, the per-depth sleep sets and pending operations, and the frontier wakeup
+/// tree. Everything is borrowed for the [`step`](Observer::step) call — clone out what
+/// you need to keep.
 pub struct StepCx<'a, 'w> {
     tree: &'a Wut,
     frames: &'a [Frame],
@@ -76,7 +73,7 @@ impl<'a, 'w> StepCx<'a, 'w> {
         }
     }
 
-    /// The live `State` at this step, for resolving names and labels.
+    /// The live `State` at this step.
     pub fn state(&self) -> &State<'w> {
         self.state
     }
@@ -121,7 +118,7 @@ impl<'a, 'w> StepCx<'a, 'w> {
         self.frames[depth].pending()
     }
 
-    /// The frontier wakeup tree's root, for walking the reversing fragments.
+    /// The frontier wakeup tree's root.
     pub fn wakeup(&self) -> WakeupNode<'a> {
         WakeupNode { node: self.tree }
     }
@@ -137,8 +134,7 @@ impl fmt::Debug for StepCx<'_, '_> {
 }
 
 /// A read-only view of one wakeup-tree node. Children are in ≺ (sibling) order;
-/// `children()[0]` is the ≺-minimal branch, explored first — walk it to inspect the
-/// reversing fragments the search still plans to run from the current frontier.
+/// `children()[0]` is the ≺-minimal branch.
 pub struct WakeupNode<'a> {
     node: &'a Wut,
 }
@@ -193,12 +189,8 @@ pub enum RaceOutcome {
     },
 }
 
-// Borrows the driver's live data, so emitting a step allocates nothing and the
-// no-op `step` reads none of it.
 /// A discrete decision of the Optimal DPOR driver, delivered to [`Observer::step`]
-/// together with a [`StepCx`]. The stream of steps narrates the whole search: every
-/// interleaving it runs to the end, every race it reverses, every branch it
-/// backtracks out of.
+/// together with a [`StepCx`].
 ///
 /// A transition a step reports as *committed* — a [`Maximal`](Step::Maximal) trace or
 /// a [`Descend`](Step::Descend)'s `committed` — can be named and labelled through the
@@ -397,8 +389,7 @@ mod tests {
                     parent_sleep,
                     child_sleep,
                 } => {
-                    // `dropped` is no longer carried by the event: a consumer derives
-                    // it as parent_sleep \ child_sleep.
+                    // `dropped` is derived by a consumer as parent_sleep \ child_sleep.
                     let dropped: Vec<usize> = parent_sleep
                         .iter()
                         .copied()

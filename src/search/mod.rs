@@ -14,7 +14,5 @@ mod optimal;
 
 pub use explore::{FailedState, explore};
 
-// The step types are the public hook for [`Observer::step`]: a consumer reads each
-// `Step<'_>` through the borrowed `StepCx` / `WakeupNode` views. They live in the
-// `observer` module alongside the trait and are surfaced through this re-export.
+// The public hook for `Observer::step`, re-exported for consumers.
 pub use observer::{Observer, RaceOutcome, Step, StepCx, WakeupNode};
