@@ -10,8 +10,7 @@
 //!
 //! That strategy is [**Optimal DPOR**](https://doi.org/10.1145/2535838.2535845)
 //! (Abdulla et al., POPL'14): it explores exactly one interleaving per
-//! Mazurkiewicz equivalence class, with no redundant work and no sleep-set
-//! blocking.
+//! Mazurkiewicz equivalence class.
 //!
 //! [`Future`]: std::future::Future
 //!
