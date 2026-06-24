@@ -49,6 +49,11 @@ pub(crate) struct Executor<'a> {
     processes: Vec<Option<Process<'a>>>,
     queue: VecDeque<ProcessID>,
     inbox: Arc<Inbox>,
+    // Count of live (scheduled but not completed) processes, maintained incrementally
+    // so `pending` is O(1) on the hot path instead of scanning the process table.
+    live: usize,
+    // Scratch buffer reused by `flush_wakes` so the per-poll drain does not allocate.
+    flush_buf: Vec<ProcessID>,
 }
 
 impl<'a> Executor<'a> {
@@ -67,6 +72,7 @@ impl<'a> Executor<'a> {
             future: Box::pin(code),
             waker,
         }));
+        self.live += 1;
         self.queue.push_back(id);
         id
     }
@@ -74,7 +80,7 @@ impl<'a> Executor<'a> {
     /// Number of live processes: scheduled but not yet completed (completion drops
     /// the slot). Used to distinguish a clean finish from a deadlock.
     pub(crate) fn pending(&self) -> usize {
-        self.processes.iter().filter(|p| p.is_some()).count()
+        self.live
     }
 
     /// Runs the poll loop until the run queue drains, returning the first process
@@ -89,7 +95,10 @@ impl<'a> Executor<'a> {
                 return Ok(());
             };
             match self.poll(id) {
-                Poll::Ready(Ok(())) => self.processes[id] = None,
+                Poll::Ready(Ok(())) => {
+                    self.processes[id] = None;
+                    self.live -= 1;
+                }
                 Poll::Ready(Err(e)) => return Err(RawProcessError { pid: id, source: e }),
                 Poll::Pending => {}
             }
@@ -110,17 +119,29 @@ impl<'a> Executor<'a> {
 
     // Moves woken processes back onto the queue. Promotes in ascending-pid order
     // so the FIFO tie-break stays replay-stable however the wakes happened to
-    // fire, and skips any process already queued (self-wake / double-wake).
+    // fire, and skips any process already queued (self-wake / double-wake). Drains
+    // into a reused scratch buffer and skips the sort/dedup when at most one process
+    // woke (the common single-wake case), so the hot path allocates nothing.
     fn flush_wakes(&mut self) {
-        let mut woken: Vec<ProcessID> = self.inbox.woken.lock().unwrap().drain(..).collect();
-        woken.sort_unstable();
-        woken.dedup();
-        for id in woken {
+        {
+            let mut woken = self.inbox.woken.lock().unwrap();
+            if woken.is_empty() {
+                return;
+            }
+            self.flush_buf.extend(woken.drain(..));
+        }
+        if self.flush_buf.len() > 1 {
+            self.flush_buf.sort_unstable();
+            self.flush_buf.dedup();
+        }
+        for i in 0..self.flush_buf.len() {
+            let id = self.flush_buf[i];
             let live = matches!(self.processes.get(id), Some(Some(_)));
             if live && !self.queue.contains(&id) {
                 self.queue.push_back(id);
             }
         }
+        self.flush_buf.clear();
     }
 }
 
@@ -132,6 +153,8 @@ impl Default for Executor<'_> {
             inbox: Arc::new(Inbox {
                 woken: Mutex::new(VecDeque::new()),
             }),
+            live: 0,
+            flush_buf: Vec::new(),
         }
     }
 }
