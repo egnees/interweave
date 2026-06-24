@@ -49,8 +49,8 @@ pub(crate) struct Executor<'a> {
     processes: Vec<Option<Process<'a>>>,
     queue: VecDeque<ProcessID>,
     inbox: Arc<Inbox>,
-    // Count of live (scheduled but not completed) processes, maintained incrementally
-    // so `pending` is O(1) on the hot path instead of scanning the process table.
+    // Count of live (scheduled but not completed) processes, kept incrementally so
+    // `pending` is O(1).
     live: usize,
     // Scratch buffer reused by `flush_wakes` so the per-poll drain does not allocate.
     flush_buf: Vec<ProcessID>,
@@ -78,14 +78,13 @@ impl<'a> Executor<'a> {
     }
 
     /// Number of live processes: scheduled but not yet completed (completion drops
-    /// the slot). Used to distinguish a clean finish from a deadlock.
+    /// the slot).
     pub(crate) fn pending(&self) -> usize {
         self.live
     }
 
     /// Runs the poll loop until the run queue drains, returning the first process
-    /// error as a [`RawProcessError`]. Does not detect deadlock — the strategy
-    /// does, by comparing [`pending`](Self::pending) against the enabled set.
+    /// error as a [`RawProcessError`]. Does not detect deadlock.
     pub(crate) fn execute(&mut self) -> Result<(), RawProcessError> {
         loop {
             // The leading flush also picks up wakes that arrived between calls
@@ -105,7 +104,7 @@ impl<'a> Executor<'a> {
         }
     }
 
-    // Polls one process once, with `pid()` set to it for the duration of the poll.
+    // `pid()` resolves to this process for the duration of the poll (set by the Guard).
     fn poll(&mut self, id: ProcessID) -> Poll<process::ProcessResult> {
         let _guard = Guard::enter(id);
         // Disjoint field borrows: the waker for the Context, the future to poll —
@@ -117,11 +116,9 @@ impl<'a> Executor<'a> {
             .poll(&mut Context::from_waker(&process.waker))
     }
 
-    // Moves woken processes back onto the queue. Promotes in ascending-pid order
-    // so the FIFO tie-break stays replay-stable however the wakes happened to
-    // fire, and skips any process already queued (self-wake / double-wake). Drains
-    // into a reused scratch buffer and skips the sort/dedup when at most one process
-    // woke (the common single-wake case), so the hot path allocates nothing.
+    // Sorts by pid before re-queuing so the FIFO tie-break stays replay-stable
+    // however the wakes fired, and skips any process already queued (self-wake /
+    // double-wake). The common single-wake case needs no sort or dedup.
     fn flush_wakes(&mut self) {
         {
             let mut woken = self.inbox.woken.lock().unwrap();
@@ -180,8 +177,7 @@ impl Drop for Guard {
 
 /// The [`ProcessID`] of the process currently being polled.
 ///
-/// This is the hook synchronization primitives use to stamp [`Transition`](super::Transition)s
-/// with their operating process. Panics if called outside an executor poll.
+/// Panics if called outside an executor poll.
 pub(crate) fn pid() -> ProcessID {
     CURRENT
         .with(Cell::get)
@@ -189,9 +185,6 @@ pub(crate) fn pid() -> ProcessID {
 }
 
 /// A process error carrying only the raw [`ProcessID`], as known to the executor.
-///
-/// `World::run` promotes this into the public, name-bearing
-/// [`ProcessError`](super::ProcessError).
 #[derive(Debug)]
 pub(crate) struct RawProcessError {
     pub(crate) pid: ProcessID,
