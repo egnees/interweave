@@ -4,7 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/interweave.svg)](https://crates.io/crates/interweave)
 [![docs.rs](https://img.shields.io/docsrs/interweave)](https://docs.rs/interweave)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![MSRV: 1.85](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
+[![MSRV: 1.96](https://img.shields.io/badge/MSRV-1.96-blue.svg)](https://blog.rust-lang.org/2026/05/28/Rust-1.96.0/)
 
 Stateless model-checking sandbox built around **Optimal DPOR** — find the
 interleaving that breaks a small concurrent program, and watch the algorithm
@@ -166,7 +166,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo rustc --lib --all-features -- -D missing_docs
 ```
 
-CI also checks the build on the 1.85 MSRV. Formatting requires **nightly** `rustfmt`
+CI also checks the build on the 1.96 MSRV. Formatting requires **nightly** `rustfmt`
 because `rustfmt.toml` enables unstable options (`wrap_comments`, `comment_width`).
 
 ## References
