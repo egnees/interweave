@@ -78,8 +78,6 @@ fn publish(world: &mut World) {
     });
 
     world.spawn("consumer", async move {
-        // No wait loop: the checker explores the schedule where the flag is
-        // already set, so a single guarded read stays a finite safety check.
         if ready.load().await == 1 {
             let v = data.load().await;
             if v != 42 {
