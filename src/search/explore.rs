@@ -6,8 +6,8 @@ use crate::model::{FailureReason, State, StateView, World};
 /// Enumerates interleavings of the program built by `setup` under Optimal DPOR.
 ///
 /// `setup` builds the program once into a fresh [`World`](crate::World) (spawning
-/// processes, creating the shared objects); it is run repeatedly to explore different
-/// schedules, so it must be deterministic.
+/// processes, creating the shared objects); it is invoked repeatedly and must be
+/// deterministic.
 /// `observer`'s [`step`](Observer::step) is notified at each discrete decision, including a
 /// [`Step::Visit`](crate::Step::Visit) for every explored state — runnable, terminal, or failed;
 /// pass `&mut ()` to observe nothing.
@@ -45,7 +45,6 @@ impl<'a> FailedState<'a> {
         Self { reason, view }
     }
 
-    // Splits a failed state into its reason and a replayable view of the prefix that reached it.
     fn from_state(state: State<'a>) -> Self {
         let (reason, view) = state.into_failure();
         Self::new(reason, view)
@@ -56,10 +55,8 @@ impl<'a> FailedState<'a> {
         &self.reason
     }
 
-    /// Replays the failing prefix from scratch, reproducing the same failure.
-    ///
-    /// Re-runs the `setup` closure and re-applies the recorded trace, yielding an equivalent
-    /// [`FailedState`].
+    /// Replays the failing prefix from scratch, reproducing the same failure as an
+    /// independent [`FailedState`].
     pub fn play(&self) -> Self {
         Self::from_state(self.view.state())
     }
