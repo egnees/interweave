@@ -452,12 +452,28 @@ fn check_initial(
     Some((v.to_vec(), q_t))
 }
 
+// Per-event vector clocks stored as one flat row-major buffer: `clock(k)[pid]` lives at
+// `flat[k * procs + pid]`. Replaces a `Vec<Vec<usize>>` (a small `Vec` per event plus a
+// per-event clone) with a single allocation — the per-leaf clock build was a dominant
+// allocator on the search hot path.
+struct Clocks {
+    flat: Vec<usize>,
+    procs: usize,
+}
+
+impl Clocks {
+    // Component `pid` of event `k`'s clock (k in 0..=n; k == 0 is ⊥).
+    fn get(&self, k: usize, pid: usize) -> usize {
+        self.flat[k * self.procs + pid]
+    }
+}
+
 // notdep(e, E): the events after e (index i, 1-based) that do not happen-after e,
 // i.e. e's index is not in their vector clock (clocks[k][proc(e)] < i).
-fn notdep(clocks: &[Vec<usize>], trace: &[Transition], i: usize) -> Vec<Transition> {
+fn notdep(clocks: &Clocks, trace: &[Transition], i: usize) -> Vec<Transition> {
     let e = trace[i - 1];
     (i + 1..=trace.len())
-        .filter(|&k| clocks[k][e.pid] < i)
+        .filter(|&k| clocks.get(k, e.pid) < i)
         .map(|k| trace[k - 1])
         .collect()
 }
@@ -468,7 +484,7 @@ fn notdep(clocks: &[Vec<usize>], trace: &[Transition], i: usize) -> Vec<Transiti
 // `plan_reversals` via `runnable_after` (it needs the candidate reordering `v`).
 fn reversible_race(
     state: &State,
-    clocks: &[Vec<usize>],
+    clocks: &Clocks,
     trace: &[Transition],
     i: usize,
     j: usize,
@@ -505,36 +521,42 @@ fn runnable_after(view: &StateView, trace: &[Transition], v: &[Transition], i: u
 }
 
 // i →_E j (event i happens-before event j), for i < j: i ≤ clocks[j][proc(event i)].
-fn happens_before(clocks: &[Vec<usize>], trace: &[Transition], i: usize, j: usize) -> bool {
-    i <= clocks[j][trace[i - 1].pid]
+fn happens_before(clocks: &Clocks, trace: &[Transition], i: usize, j: usize) -> bool {
+    i <= clocks.get(j, trace[i - 1].pid)
 }
 
-// Per-event vector clocks. clocks[k] (k in 1..=n) is the k-th event's clock;
-// clocks[0] is ⊥. Each clock starts from its process's previous clock (program
-// order) and merges every dependent predecessor, then sets its own component to k.
-// The program-order seed keeps two same-process ops ordered even when the
-// dependency relation calls them independent (e.g. two loads).
-fn event_clocks(state: &State, trace: &[Transition]) -> Vec<Vec<usize>> {
+// Per-event vector clocks. clock(k) (k in 1..=n) is the k-th event's clock; clock(0)
+// is ⊥. Each clock starts from its process's previous clock (program order) and merges
+// every dependent predecessor, then sets its own component to k. The program-order seed
+// keeps two same-process ops ordered even when the dependency relation calls them
+// independent (e.g. two loads). All clocks share one flat buffer (see [`Clocks`]);
+// `last[p]` is the event index of process p's current clock (0 = ⊥), avoiding a
+// per-event clone.
+fn event_clocks(state: &State, trace: &[Transition]) -> Clocks {
     let procs = state.world().processes().len();
     let n = trace.len();
-    let mut last = vec![vec![0usize; procs]; procs]; // last[p] = process p's current clock
-    let mut clocks: Vec<Vec<usize>> = Vec::with_capacity(n + 1);
-    clocks.push(vec![0; procs]);
+    let mut flat = vec![0usize; (n + 1) * procs];
+    let mut last = vec![0usize; procs];
     for k in 1..=n {
         let t = trace[k - 1];
-        let mut clock = last[t.pid].clone();
+        // Seed from this process's previous clock (program order). src < k, so the rows
+        // are distinct.
+        let src = last[t.pid];
+        flat.copy_within(src * procs..src * procs + procs, k * procs);
         for j in 1..k {
             if state.depends(trace[j - 1], t) {
-                for (c, &pred) in clock.iter_mut().zip(&clocks[j]) {
-                    *c = (*c).max(pred);
+                for p in 0..procs {
+                    let pred = flat[j * procs + p];
+                    if pred > flat[k * procs + p] {
+                        flat[k * procs + p] = pred;
+                    }
                 }
             }
         }
-        clock[t.pid] = k;
-        last[t.pid] = clock.clone();
-        clocks.push(clock);
+        flat[k * procs + t.pid] = k;
+        last[t.pid] = k;
     }
-    clocks
+    Clocks { flat, procs }
 }
 
 // One enabled process not in `sleep` (least pid, for determinism), or `None` at a
