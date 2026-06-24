@@ -107,6 +107,10 @@ impl<T: Copy + PartialEq + Debug> Atomic<T> {
         self.requests.iter().map(|r| r.transition).collect()
     }
 
+    fn enabled_into(&self, out: &mut Vec<Transition>) {
+        out.extend(self.requests.iter().map(|r| r.transition));
+    }
+
     // Resolves a transition's op whether it is still pending or already committed. DPOR asks about
     // a past transition (in `history`) against a process's next op (still in `requests`), so both
     // vectors must be searched.
@@ -227,6 +231,10 @@ impl<T: Copy + PartialEq + Debug + 'static> Object for Handle<T> {
 
     fn enabled(&self) -> Vec<Transition> {
         self.atomic.borrow().enabled()
+    }
+
+    fn enabled_into(&self, out: &mut Vec<Transition>) {
+        self.atomic.borrow().enabled_into(out);
     }
 
     fn label(&self, t: Transition) -> String {

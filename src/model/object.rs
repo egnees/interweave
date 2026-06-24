@@ -117,6 +117,14 @@ pub trait Object {
     /// becomes runnable; that is how a primitive blocks a process.
     fn enabled(&self) -> Vec<Transition>;
 
+    /// Appends the currently-enabled transitions to `out` instead of allocating a
+    /// fresh [`Vec`]. The search recomputes the enabled set on every committed step,
+    /// so overriding this to push directly into the shared buffer avoids a per-object
+    /// allocation on the hot path. The default defers to [`enabled`](Object::enabled).
+    fn enabled_into(&self, out: &mut Vec<Transition>) {
+        out.extend(self.enabled());
+    }
+
     /// A human-readable label for an already-[`apply`](Object::apply)ied
     /// transition, e.g. `"load -> 123"`. Only ever called after the commit, so it
     /// may rely on recorded history.

@@ -90,7 +90,7 @@ pub(super) fn run<'a>(
     let mut tree = Wut::default();
     let mut frames: Vec<Frame> = vec![Frame {
         sleep: Vec::new(),
-        pending: root.enabled(),
+        pending: root.enabled().to_vec(),
     }];
     observer.step(Step::Visit, StepCx::new(&tree, &frames, &[], &root));
     if root.is_failed() {
@@ -187,7 +187,7 @@ pub(super) fn run<'a>(
 
         frames.push(Frame {
             sleep: child_sleep,
-            pending: cur.enabled(),
+            pending: cur.enabled().to_vec(),
         });
         prefix.push(p_t);
 
@@ -557,12 +557,12 @@ fn seed(state: &State, sleep: &[usize]) -> Option<usize> {
 }
 
 fn enabled_pids(state: &State) -> BTreeSet<usize> {
-    state.enabled().into_iter().map(|t| t.pid).collect()
+    state.enabled().iter().map(|t| t.pid).collect()
 }
 
 // Process p's next op, or `None` if p has finished.
 fn resolve(state: &State, p: usize) -> Option<Transition> {
-    state.enabled().into_iter().find(|t| t.pid == p)
+    state.enabled().iter().copied().find(|t| t.pid == p)
 }
 
 // The node `depth` ≺-minimal children below `root` (the all-front-child descent the
@@ -608,7 +608,7 @@ mod tests {
             let (reason, view) = state.into_failure();
             return Err(FailedState::new(reason, view));
         }
-        for t in state.enabled() {
+        for &t in state.enabled() {
             let mut next = state.fork();
             next.apply(t);
             dfs(next, observer)?;

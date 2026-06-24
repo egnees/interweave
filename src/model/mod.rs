@@ -186,6 +186,11 @@ pub struct State<'a> {
     setup: &'a dyn Fn(&mut World<'a>),
     trace: Vec<Transition>,
     failure: Option<FailureReason>,
+    // The enabled set, cached and recomputed once per committed step (after `run`,
+    // before `settle`). Every read goes through this rather than re-querying the
+    // objects, which on the replay-heavy hot path saves a per-object allocation per
+    // access.
+    enabled: Vec<Transition>,
 }
 
 impl Debug for State<'_> {
@@ -247,7 +252,9 @@ impl<'a> State<'a> {
             setup,
             trace: Vec::new(),
             failure,
+            enabled: Vec::new(),
         };
+        state.recompute_enabled();
         state.settle();
         state
     }
@@ -275,7 +282,7 @@ impl<'a> State<'a> {
     ///
     /// [`Observer`]: crate::Observer
     pub fn is_terminal(&self) -> bool {
-        self.failure.is_some() || self.enabled().is_empty()
+        self.failure.is_some() || self.enabled.is_empty()
     }
 
     pub(crate) fn is_failed(&self) -> bool {
@@ -286,14 +293,21 @@ impl<'a> State<'a> {
         self.world.exec.pending()
     }
 
-    pub(crate) fn enabled(&self) -> Vec<Transition> {
-        // Fixed iteration order (objects, then each object's requests, both
-        // insertion-ordered) is what lets replay rebuild identical states.
-        self.world
-            .objects
-            .iter()
-            .flat_map(|o| o.enabled())
-            .collect()
+    pub(crate) fn enabled(&self) -> &[Transition] {
+        &self.enabled
+    }
+
+    // Refreshes the cached enabled set from the objects. Fixed iteration order
+    // (objects, then each object's requests, both insertion-ordered) is what lets
+    // replay rebuild identical states. Called once per committed step, after `run`
+    // has registered the woken processes' next ops and before `settle` reads it.
+    fn recompute_enabled(&mut self) {
+        let mut buf = std::mem::take(&mut self.enabled);
+        buf.clear();
+        for o in &self.world.objects {
+            o.enabled_into(&mut buf);
+        }
+        self.enabled = buf;
     }
 
     /// Whether two transitions *conflict* — fail to commute, so the order in which they
@@ -319,13 +333,15 @@ impl<'a> State<'a> {
         self.trace.push(t);
         self.world.objects[t.oid].apply(t);
         self.failure = self.world.run();
+        self.recompute_enabled();
         self.settle();
     }
 
     // No process erred but nothing is enabled while a process is still live:
-    // deadlock. An already-set process error takes precedence.
+    // deadlock. An already-set process error takes precedence. Reads the freshly
+    // recomputed enabled cache.
     fn settle(&mut self) {
-        if self.failure.is_none() && self.enabled().is_empty() && self.pending() > 0 {
+        if self.failure.is_none() && self.enabled.is_empty() && self.pending() > 0 {
             self.failure = Some(FailureReason::Deadlock);
         }
     }

@@ -135,15 +135,22 @@ impl<T: Debug> Channel<T> {
     // Sends never block; a recv blocks while the queue is empty. Insertion order is fixed for
     // replay determinism.
     fn enabled(&self) -> Vec<Transition> {
+        let mut out = Vec::new();
+        self.enabled_into(&mut out);
+        out
+    }
+
+    fn enabled_into(&self, out: &mut Vec<Transition>) {
         let queue_nonempty = !self.queue.is_empty();
-        self.requests
-            .iter()
-            .filter(|r| match r.op {
-                Op::Send { .. } => true,
-                Op::Recv { .. } => queue_nonempty,
-            })
-            .map(|r| r.transition)
-            .collect()
+        out.extend(
+            self.requests
+                .iter()
+                .filter(|r| match r.op {
+                    Op::Send { .. } => true,
+                    Op::Recv { .. } => queue_nonempty,
+                })
+                .map(|r| r.transition),
+        );
     }
 
     // Resolves a transition's kind whether still pending or already committed; DPOR asks about a
@@ -236,6 +243,10 @@ impl<T: Debug + 'static> Object for ChannelHandle<T> {
 
     fn enabled(&self) -> Vec<Transition> {
         self.chan.borrow().enabled()
+    }
+
+    fn enabled_into(&self, out: &mut Vec<Transition>) {
+        self.chan.borrow().enabled_into(out);
     }
 
     fn label(&self, t: Transition) -> String {
