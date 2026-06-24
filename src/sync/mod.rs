@@ -1,9 +1,8 @@
 //! Synchronization primitives whose every observable operation is a scheduling point.
 //!
-//! Each primitive is implemented from scratch so that operations that may interact across
-//! processes become explicit `.await` yield points carrying enough metadata (process id, object,
-//! operation kind, target value) for the search layer to compute happens-before and dependency
-//! relations. This module provides [`Atomic`] and an unbounded MPSC channel.
+//! Operations that may interact across processes become explicit `.await` yield points, so the
+//! checker can interleave them. This module provides [`Atomic`] and an unbounded MPSC channel
+//! ([`Sender`] / [`Receiver`]).
 
 mod atomic;
 mod channel;
