@@ -13,7 +13,7 @@
 //! registration time.
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     fmt::Debug,
     future::poll_fn,
     rc::Rc,
@@ -39,9 +39,6 @@ struct Request<T> {
     transition: Transition,
     waker: Waker,
     op: Op<T>,
-    // The commit writes the observed (previous) value here; the future reads it back to resolve
-    // its `.await`.
-    result: Rc<Cell<Option<T>>>,
 }
 
 // `prev` is the value observed at commit time; for a store it is also what was overwritten.
@@ -56,6 +53,11 @@ struct Atomic<T> {
     id: ObjectID,
     requests: Vec<Request<T>>,
     history: Vec<Record<T>>,
+    // The observed value of each op, indexed by its `seq`; the commit fills its slot and
+    // the awaiting future reads it back in O(1). Replaces a per-op `Rc<Cell>` result
+    // channel — a heap allocation on every operation — which on the replay-heavy hot
+    // path was a dominant cost.
+    committed: Vec<Option<T>>,
     seq: usize,
 }
 
@@ -66,19 +68,28 @@ impl<T: Copy + PartialEq + Debug> Atomic<T> {
             id,
             requests: Vec::new(),
             history: Vec::new(),
+            committed: Vec::new(),
             seq: 0,
         }
     }
 
-    fn register(&mut self, op: Op<T>, waker: Waker, result: Rc<Cell<Option<T>>>) {
+    // Registers an op and returns its transition; the future keeps the transition and
+    // later reads `result(seq)` once the commit fills it.
+    fn register(&mut self, op: Op<T>, waker: Waker) -> Transition {
         let transition = Transition::new(self.id, self.seq);
         self.seq += 1;
+        self.committed.push(None);
         self.requests.push(Request {
             transition,
             waker,
             op,
-            result,
         });
+        transition
+    }
+
+    // The observed value of a committed op (by seq), or `None` until it commits.
+    fn result(&self, seq: usize) -> Option<T> {
+        self.committed[seq]
     }
 
     // Commits one pending op: a store (or a matching compare-exchange) writes the new value, every
@@ -99,7 +110,7 @@ impl<T: Copy + PartialEq + Debug> Atomic<T> {
             op: req.op,
             prev,
         });
-        req.result.set(Some(prev));
+        self.committed[t.seq] = Some(prev);
         req.waker.wake();
     }
 
@@ -202,22 +213,22 @@ impl<T: Copy + PartialEq + Debug> Handle<T> {
         if prev == current { Ok(prev) } else { Err(prev) }
     }
 
-    // First poll registers the op and yields so the strategy can pick it; the commit fills `result`
-    // and wakes us, and the next poll reads it back. A spurious poll before the commit finds
-    // `result` empty and stays pending. `op.take()` registers at most once, so re-polling while
-    // pending does not register a second op.
+    // First poll registers the op (recording its transition) and yields so the strategy can pick
+    // it; the commit fills `committed[seq]` and wakes us, and the next poll reads it back. A
+    // spurious poll before the commit finds the slot empty and stays pending. `op.take()` registers
+    // at most once, so re-polling while pending does not register a second op.
     async fn request(&self, op: Op<T>) -> T {
-        let result = Rc::new(Cell::new(None));
+        let mut registered: Option<Transition> = None;
         let mut op = Some(op);
         poll_fn(move |cx| {
-            if let Some(value) = result.get() {
-                return Poll::Ready(value);
+            if let Some(t) = registered {
+                return match self.atomic.borrow().result(t.seq) {
+                    Some(value) => Poll::Ready(value),
+                    None => Poll::Pending,
+                };
             }
-            if let Some(op) = op.take() {
-                self.atomic
-                    .borrow_mut()
-                    .register(op, cx.waker().clone(), Rc::clone(&result));
-            }
+            let op = op.take().expect("request future polled after completion");
+            registered = Some(self.atomic.borrow_mut().register(op, cx.waker().clone()));
             Poll::Pending
         })
         .await
