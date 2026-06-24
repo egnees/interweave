@@ -1,16 +1,12 @@
 //! An unbounded MPSC channel whose send / recv operations are `.await` yield points.
 //!
 //! [`Sender`] (cloneable, multi-producer) and [`Receiver`] (`!Clone`, single-consumer) are handles
-//! to one shared [`Channel`]. Every operation registers itself on its first poll and yields, so the
-//! search strategy decides *when* each send or recv commits relative to operations on the same
-//! channel. Each commit is a distinct scheduling point with a [`Transition`] the model checker can
-//! reorder.
+//! to one shared [`Channel`]. Every operation registers itself on its first poll and yields. Each
+//! commit is a distinct scheduling point with a [`Transition`].
 //!
-//! Operations are split into registration and commit exactly like [`Atomic`](crate::Atomic):
-//! registration records the intended op and its waker; commit (via [`Object::apply`]) mutates the
-//! queue and wakes the committing process so its `.await` resolves. A `recv` registered against an
-//! empty queue is withheld from [`enabled`](Object::enabled) — that is how the consumer blocks, and
-//! `State::settle` turns a live consumer with nothing enabled into a deadlock.
+//! A `recv` registered against an empty queue is withheld from [`enabled`](Object::enabled) — that
+//! is how the consumer blocks, and `State::settle` turns a live consumer with nothing enabled into
+//! a deadlock.
 
 use std::{
     cell::{Cell, RefCell},
@@ -98,9 +94,9 @@ impl<T: Debug> Channel<T> {
         });
     }
 
-    // Commits one pending op: a send enqueues its value; a recv pops the head. Only the committing
-    // op's process is woken — a blocked recv becomes selectable through `enabled` reading the
-    // queue, not by being re-queued in the executor (symmetric with `Atomic::apply`).
+    // Only the committing op's process is woken — a blocked recv becomes selectable through
+    // `enabled` reading the queue, not by being re-queued in the executor (symmetric with
+    // `Atomic::apply`).
     fn apply(&mut self, t: Transition) {
         let Some(i) = self.requests.iter().position(|r| r.transition == t) else {
             panic!("transition must be enabled");
@@ -260,8 +256,8 @@ impl<T: Debug + 'static> Object for ChannelHandle<T> {
 
 /// The sending half of an MPSC channel; cloneable, so several producers can share it.
 ///
-/// [`send`](Sender::send) is an `async` method: awaiting it registers the send and yields, so the
-/// commit becomes a [`Transition`] the strategy schedules against other operations on the channel.
+/// [`send`](Sender::send) is an `async` method: awaiting it registers the send and yields at a
+/// scheduling point.
 pub struct Sender<T> {
     chan: Rc<RefCell<Channel<T>>>,
 }
@@ -291,11 +287,11 @@ impl<T> std::fmt::Debug for Sender<T> {
 impl<T: Debug> Sender<T> {
     /// Enqueues `value` at the back of the channel.
     ///
-    /// Awaiting this is a scheduling point: the value is enqueued when the strategy selects this
-    /// send's [`Transition`]. Always succeeds — the channel is unbounded.
+    /// Awaiting this is a scheduling point: the value is enqueued when this send commits. Always
+    /// succeeds — the channel is unbounded.
     pub async fn send(&self, value: T) {
-        // First poll registers the send and yields; the commit sets `done` and wakes us, and the
-        // next poll sees the flag and resolves. `value` is moved into the request at registration.
+        // `pending.take()` registers at most once, so a spurious re-poll before the commit
+        // re-yields instead of registering a second send.
         let done = Rc::new(Cell::new(false));
         let mut pending = Some(value);
         poll_fn(move |cx| {
@@ -323,8 +319,7 @@ impl<T: Debug> Sender<T> {
 /// That single-consumer invariant is a contract you must uphold, not one the type system can
 /// guarantee: [`recv`](Receiver::recv) takes `&self`, so nothing stops you from sharing one
 /// `Receiver` across processes (for instance behind an `Rc`). Doing so is rejected at run time
-/// with a panic — two consumers would make the receive order observable and could hide reachable
-/// interleavings.
+/// with a panic.
 ///
 /// [`recv`](Receiver::recv) is an `async` method: awaiting it registers the recv and yields,
 /// blocking while the channel is empty.
@@ -347,11 +342,11 @@ impl<T> std::fmt::Debug for Receiver<T> {
 impl<T: Debug> Receiver<T> {
     /// Removes and returns the message at the front of the channel, blocking while it is empty.
     ///
-    /// Awaiting this is a scheduling point: the recv commits (and the head is popped) when the
-    /// strategy selects this recv's [`Transition`], which only happens once the queue is non-empty.
+    /// Awaiting this is a scheduling point: the recv commits (and the head is popped) only once the
+    /// queue is non-empty.
     pub async fn recv(&self) -> T {
-        // First poll registers the recv and yields; the commit fills `slot` and wakes us, and the
-        // next poll reads the popped value back.
+        // The `registered` guard registers at most once, so a spurious re-poll before the commit
+        // re-yields instead of registering a second recv.
         let slot = Rc::new(Cell::new(None));
         let mut registered = false;
         poll_fn(move |cx| {
