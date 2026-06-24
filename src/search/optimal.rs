@@ -1370,9 +1370,9 @@ mod tests {
         assert_optimal(&|w| lastzero(w, 3));
     }
 
-    // lastzero(4) has ~44k DFS interleavings — borderline slow in debug.
+    // lastzero(4) has ~44k DFS interleavings — too slow for a debug build, so release-only.
+    #[cfg(not(debug_assertions))]
     #[test]
-    #[ignore]
     fn lastzero_4_ground_truth() {
         assert_optimal(&|w| lastzero(w, 4));
     }
@@ -1384,9 +1384,9 @@ mod tests {
         assert_eq!(leaves(&|w| lastzero(w, 10)), 3328);
     }
 
-    // ~300M apply-ops: run with `cargo test -- --ignored --release`.
+    // ~300M apply-ops — too slow for a debug build, so release-only.
+    #[cfg(not(debug_assertions))]
     #[test]
-    #[ignore]
     fn lastzero_15_paper_count() {
         assert_eq!(leaves(&|w| lastzero(w, 15)), 147456);
     }
@@ -1403,9 +1403,9 @@ mod tests {
         assert_eq!(leaves(&|w| indexer(w, 12)), 8);
     }
 
-    // ~21M apply-ops: run with `cargo test -- --ignored --release`.
+    // ~21M apply-ops — too slow for a debug build, so release-only.
+    #[cfg(not(debug_assertions))]
     #[test]
-    #[ignore]
     fn indexer_15_paper_count() {
         assert_eq!(leaves(&|w| indexer(w, 15)), 4096);
     }

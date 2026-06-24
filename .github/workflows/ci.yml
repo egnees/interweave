@@ -34,8 +34,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Test
+      - name: Test (debug)
         run: cargo test --all-features
+
+      # Release also compiles in the `#[cfg(not(debug_assertions))]` tests — the
+      # heavy paper-count / ground-truth runs that are too slow for a debug build.
+      - name: Test (release)
+        run: cargo test --release --all-features
 
       # Catch docs.rs-breaking changes (broken intra-doc links, doc warnings) and
       # missing public docs on every PR — docs are the crate's public face.
