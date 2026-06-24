@@ -23,10 +23,10 @@ use crate::model::{State, StateView, Transition};
 // the descent uses — and run the dependency tests against that live state, where every
 // op's kind is exact. (`insert` replays the branch prefix once and threads the live
 // state down its descent, replaying again only where a walk advanced the state past
-// events the next level still needs.) An earlier version resolved carried edges against
-// the maximal trace by `(pid, oid)`; that silently dropped reachable classes whenever
-// one process performed two differently-conflicting ops on one object, e.g. the everyday
-// `load` then `store` on a cell a third process also reads.
+// events the next level still needs.) Resolving a carried edge by `(pid, oid)` against
+// the maximal trace instead would alias a process's two differently-conflicting ops on
+// one object (e.g. the everyday `load` then `store` on a cell a third process reads) and
+// drop reachable classes.
 //
 // `pub(super)` (with a read accessor below) so the step-instrumentation module can
 // expose the live frontier tree through `WakeupNode`; the field stays private to this
@@ -465,7 +465,7 @@ struct WeakInitial {
 
 // One walk of `v` over the live `state` (already at the relevant prefix) classifying
 // every candidate pid, returning the first candidate (in order) that is a weak-initial.
-// Replaces a per-candidate `check_initial`: each candidate's q_t is resolved up front
+// Each candidate's q_t is resolved up front
 // (applying another process's op never changes a not-yet-applied process's next op);
 // then for each `vk` in order a candidate is *matched* when `vk.pid` is it, or *killed*
 // when an earlier `vk` depends on its q_t or when some `vk` cannot run here (v not
@@ -509,8 +509,8 @@ fn weak_initial_walk(
     };
 
     for (k, &vk) in v.iter().enumerate() {
-        // A candidate whose pid is vk matches here (distinct pids ⇒ at most one). This
-        // mirrors `check_initial` returning before it resolves/depends-tests vk.
+        // A candidate whose pid is vk matches here (distinct pids ⇒ at most one),
+        // before any resolve or depends-test of vk.
         for ci in 0..candidates.len() {
             if !killed[ci] && matched[ci].is_none() && vk.pid == candidates[ci] {
                 matched[ci] = Some(k);
@@ -546,9 +546,7 @@ fn weak_initial_walk(
 }
 
 // Per-event vector clocks stored as one flat row-major buffer: `clock(k)[pid]` lives at
-// `flat[k * procs + pid]`. Replaces a `Vec<Vec<usize>>` (a small `Vec` per event plus a
-// per-event clone) with a single allocation — the per-leaf clock build was a dominant
-// allocator on the search hot path.
+// `flat[k * procs + pid]`.
 struct Clocks {
     flat: Vec<usize>,
     procs: usize,
@@ -623,8 +621,7 @@ fn happens_before(clocks: &Clocks, trace: &[Transition], i: usize, j: usize) -> 
 // every dependent predecessor, then sets its own component to k. The program-order seed
 // keeps two same-process ops ordered even when the dependency relation calls them
 // independent (e.g. two loads). All clocks share one flat buffer (see [`Clocks`]);
-// `last[p]` is the event index of process p's current clock (0 = ⊥), avoiding a
-// per-event clone.
+// `last[p]` is the event index of process p's current clock (0 = ⊥).
 fn event_clocks(state: &State, trace: &[Transition]) -> Clocks {
     let procs = state.world().processes().len();
     let n = trace.len();
@@ -709,7 +706,7 @@ mod tests {
     use crate::search::{FailedState, Observer, Step, StepCx, explore};
 
     // Exhaustive DFS over every interleaving — the ground-truth oracle Optimal is
-    // checked against. Mirrors the old public driver, kept test-only.
+    // checked against.
     fn dfs<'a>(state: State<'a>, observer: &mut impl Observer) -> Result<(), FailedState<'a>> {
         // The oracle has no wakeup tree/frames, so it builds empty locals and passes
         // the state's own trace as the prefix for the `Visit` `StepCx`.
@@ -1115,10 +1112,9 @@ mod tests {
         });
     }
 
-    // The exact program that panicked under Optimal before the `restamp` fix: a racy
-    // atomic read sits between sends, so a later send's per-object seq drifts with the
-    // g load/store order — the stale-seq case `restamp` repairs. 3! send orders × 2
-    // for the g race.
+    // A racy atomic read sits between sends, so a later send's per-object seq depends on
+    // the g load/store order — a stale seq the wakeup tree must re-resolve by replay. 3!
+    // send orders × 2 for the g race.
     fn seq_drift(world: &mut World) {
         let g = world.atomic("g", 0i32);
         let (tx, rx) = world.channel::<i32>("ch");
@@ -1341,10 +1337,9 @@ mod tests {
 
     #[test]
     fn channel_seq_drift_no_panic() {
-        // A racy atomic op between sends drifts a later send's per-object seq across
-        // interleavings, so the wakeup tree must resolve carried edges by replay (a
-        // stale seq would panic in the channel's `kind_of`). 3! send orders × 2 for
-        // the g load/store race.
+        // A racy atomic op between sends makes a later send's per-object seq depend on
+        // the g load/store order, so the wakeup tree resolves carried edges by replay
+        // rather than the stored seq. 3! send orders × 2 for the g load/store race.
         assert_optimal(&seq_drift);
         assert_leaves(&seq_drift, 608, 12);
     }
@@ -1415,11 +1410,11 @@ mod tests {
         assert_eq!(leaves(&|w| indexer(w, 15)), 4096);
     }
 
-    // --- same-object multi-op (wakeup-tree aliasing regression) ------------------
-    // A process performing two differently-conflicting ops on ONE object used to be
-    // aliased by `(pid, oid)` when a carried wakeup-tree edge was resolved, silently
-    // dropping reachable classes (and reachable failures). These pin that the everyday
-    // read-modify-write idiom keeps every class.
+    // --- same-object multi-op ---------------------------------------------------
+    // A process performing two differently-conflicting ops on ONE object — the everyday
+    // read-modify-write idiom — must keep every reachable class (and reachable failure):
+    // the wakeup tree resolves each carried edge by pid and replay, not by `(pid, oid)`.
+    // These pin that.
 
     // The writer loads then stores x; a reader loads x. The reader can observe x's
     // initial value (its load before the store) or the stored 1 — two classes.
@@ -1461,7 +1456,7 @@ mod tests {
     }
 
     // The reader errors if it observes the pre-store value — an outcome only reachable
-    // on the class the aliasing bug dropped, so finding it proves soundness.
+    // on the reader-before-store class, so finding it proves soundness.
     fn read_modify_killer(world: &mut World) {
         let x = world.atomic("x", 0u32);
         let w = x.clone();
@@ -1514,9 +1509,9 @@ mod tests {
     }
 
     // A pseudo-random multi-op atomic program: two or three processes, each a short
-    // fixed sequence of load/store/cas over one or two shared cells. The aliasing bug
-    // hid reachable classes on exactly this shape, so `optimal == #classes` (and the
-    // ≤ DFS bound) across many shapes is the broad guard that would have caught it.
+    // fixed sequence of load/store/cas over one or two shared cells. `optimal ==
+    // #classes` (and the ≤ DFS bound) across many shapes is a broad soundness guard for
+    // same-object multi-op.
     fn random_atomics(seed: u64, world: &mut World) {
         let mut s = seed.wrapping_add(1);
         let cells_n = 1 + (lcg(&mut s) % 2) as usize;
@@ -1564,7 +1559,7 @@ mod tests {
 
     // Two producers each send twice on one channel; the consumer recvs all four. Each
     // producer's two sends are a same-object multi-op, forcing a deep wakeup-tree
-    // descent — the channel analog of the atomic read-modify regression above.
+    // descent — the channel analog of the atomic read-modify case above.
     fn two_producers_two_sends(world: &mut World) {
         let (tx, rx) = world.channel::<i32>("ch");
         let tx2 = tx.clone();
