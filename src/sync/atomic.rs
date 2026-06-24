@@ -2,15 +2,11 @@
 //!
 //! [`Handle`] (re-exported as [`Atomic`](crate::Atomic)) is a cloneable handle to a shared
 //! atomic cell. Every operation registers itself with the cell on its first poll and then
-//! yields control back to the executor, so the search strategy can decide *when* it commits
-//! relative to other processes' operations on the same cell. Each commit is therefore a distinct
-//! scheduling point with a [`Transition`] the model checker can reorder.
+//! yields control back to the executor. Each commit is a distinct scheduling point with a
+//! [`Transition`].
 //!
-//! Operations are split into registration and commit: registration records the intended op and
-//! its waker; commit (driven by the strategy via [`Object::apply`]) reads the value present at
-//! that moment, applies any write, and wakes the process so it can read the observed value back.
-//! This is what makes a compare-exchange evaluate its comparison at *commit* time rather than at
-//! registration time.
+//! A compare-exchange evaluates its comparison against the value present at *commit* time, not
+//! when it was awaited.
 
 use std::{
     cell::RefCell,
@@ -53,10 +49,7 @@ struct Atomic<T> {
     id: ObjectID,
     requests: Vec<Request<T>>,
     history: Vec<Record<T>>,
-    // The observed value of each op, indexed by its `seq`; the commit fills its slot and
-    // the awaiting future reads it back in O(1). Replaces a per-op `Rc<Cell>` result
-    // channel — a heap allocation on every operation — which on the replay-heavy hot
-    // path was a dominant cost.
+    // Observed value of each op, indexed by `seq`; the commit fills its slot.
     committed: Vec<Option<T>>,
     seq: usize,
 }
@@ -73,8 +66,6 @@ impl<T: Copy + PartialEq + Debug> Atomic<T> {
         }
     }
 
-    // Registers an op and returns its transition; the future keeps the transition and
-    // later reads `result(seq)` once the commit fills it.
     fn register(&mut self, op: Op<T>, waker: Waker) -> Transition {
         let transition = Transition::new(self.id, self.seq);
         self.seq += 1;
@@ -87,7 +78,6 @@ impl<T: Copy + PartialEq + Debug> Atomic<T> {
         transition
     }
 
-    // The observed value of a committed op (by seq), or `None` until it commits.
     fn result(&self, seq: usize) -> Option<T> {
         self.committed[seq]
     }
@@ -167,8 +157,8 @@ impl<T: Copy + PartialEq + Debug> Atomic<T> {
 ///
 /// Every operation ([`store`](Handle::store), [`load`](Handle::load),
 /// [`compare_exchange`](Handle::compare_exchange)) is an `async` method: awaiting it registers the
-/// operation and yields, turning the commit into a [`Transition`] the search strategy schedules
-/// against other processes' operations on the same cell.
+/// operation and yields, and its commit is a [`Transition`] scheduled against other processes'
+/// operations on the same cell.
 #[derive(Clone)]
 pub struct Handle<T: Copy + PartialEq + Debug> {
     atomic: Rc<RefCell<Atomic<T>>>,
@@ -183,19 +173,16 @@ impl<T: Copy + PartialEq + Debug> Handle<T> {
 
     /// Writes `value` into the cell, returning the value it overwrote.
     ///
-    /// Awaiting this is a scheduling point: the write commits when the strategy selects this
-    /// operation's [`Transition`], and the returned value is whatever the cell held just before
-    /// the commit.
+    /// Awaiting this is a scheduling point: the returned value is whatever the cell held just
+    /// before the write commits.
     pub async fn store(&self, value: T) -> T {
         self.request(Op::Store(value)).await
     }
 
     /// Reads the cell's current value without modifying it.
     ///
-    /// Awaiting this is a scheduling point: the read commits when the strategy selects this
-    /// operation's [`Transition`], and the returned value is whatever the cell holds at that
-    /// moment. Two loads on the same cell are independent (they commute), so the
-    /// search need not explore both of their orderings.
+    /// Awaiting this is a scheduling point: the returned value is whatever the cell holds when the
+    /// read commits. Two loads on the same cell are independent (they commute).
     pub async fn load(&self) -> T {
         self.request(Op::Load).await
     }
@@ -213,10 +200,8 @@ impl<T: Copy + PartialEq + Debug> Handle<T> {
         if prev == current { Ok(prev) } else { Err(prev) }
     }
 
-    // First poll registers the op (recording its transition) and yields so the strategy can pick
-    // it; the commit fills `committed[seq]` and wakes us, and the next poll reads it back. A
-    // spurious poll before the commit finds the slot empty and stays pending. `op.take()` registers
-    // at most once, so re-polling while pending does not register a second op.
+    // `op.take()` plus the `registered` guard register at most once, so a spurious re-poll
+    // before the commit re-yields instead of registering the op a second time.
     async fn request(&self, op: Op<T>) -> T {
         let mut registered: Option<Transition> = None;
         let mut op = Some(op);
