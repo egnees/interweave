@@ -1,7 +1,7 @@
 # interweave
 
 [![CI](https://github.com/egnees/interweave/actions/workflows/ci.yml/badge.svg)](https://github.com/egnees/interweave/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/interweave.svg)](https://crates.io/crates/interweave)
+[![crates.io](https://img.shields.io/crates/v/interweave)](https://crates.io/crates/interweave)
 [![docs.rs](https://docs.rs/interweave/badge.svg)](https://docs.rs/interweave)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![MSRV: 1.96](https://img.shields.io/badge/MSRV-1.96-blue.svg)](https://blog.rust-lang.org/2026/05/28/Rust-1.96.0/)
