@@ -23,8 +23,7 @@ use crate::sync::{Atomic, ChannelHandle, Receiver, Sender};
 /// The program under test: a builder that owns the processes and synchronization
 /// objects created on it. A setup closure populates it via [`spawn`](World::spawn),
 /// [`atomic`](World::atomic), and [`channel`](World::channel). That closure must be
-/// deterministic — building the same objects in the same order every time — because
-/// the search runs it repeatedly to explore different schedules.
+/// deterministic — building the same objects in the same order every time.
 pub struct World<'a> {
     objects: Vec<Box<dyn Object>>,
     exec: Executor<'a>,
@@ -187,9 +186,7 @@ pub struct State<'a> {
     trace: Vec<Transition>,
     failure: Option<FailureReason>,
     // The enabled set, cached and recomputed once per committed step (after `run`,
-    // before `settle`). Every read goes through this rather than re-querying the
-    // objects, which on the replay-heavy hot path saves a per-object allocation per
-    // access.
+    // before `settle`).
     enabled: Vec<Transition>,
     // Whether no registered object can block a process (every object reports
     // `!may_block`). Fixed by the object set, so computed once at construction. Lets
@@ -240,7 +237,6 @@ impl<'a> StateView<'a> {
         state
     }
 
-    // Rebuilds the full state by replaying the recorded schedule.
     pub(crate) fn state(&self) -> State<'a> {
         self.replay(&self.trace)
     }
@@ -324,10 +320,8 @@ impl<'a> State<'a> {
     }
 
     /// Whether two transitions *conflict* — fail to commute, so the order in which they
-    /// commit can change the outcome. This is the dependency relation that drives
-    /// partial-order reduction: independent transitions may be reordered freely, while
-    /// dependent ones must be explored in both orders. Use it to reconstruct
-    /// happens-before over a trace (e.g. for a visualization or a custom analysis).
+    /// commit can change the outcome. Use it to reconstruct happens-before over a trace
+    /// (e.g. for a visualization or a custom analysis).
     ///
     /// Evaluate it on a state where both transitions have occurred (e.g. a maximal trace):
     /// for history-sensitive primitives (channels) the answer depends on the committed
